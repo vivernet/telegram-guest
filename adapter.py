@@ -891,8 +891,6 @@ def _wire_guest_handler(app, adapter) -> None:
 
 
 def register(ctx) -> None:
-    from plugins.platforms.telegram import gateway_env
-
     ctx.register_platform_handler("telegram", _wire_guest_handler)
     ctx.register_platform(
         name="telegram",
@@ -911,6 +909,4 @@ def register(ctx) -> None:
         max_message_length=4096,
         emoji="✈️",
         allow_update_command=True,
-        env_overrides=gateway_env.ENV_OVERRIDES,
-        env_enable_credentials=gateway_env.ENV_ENABLE_CREDENTIALS,
     )
