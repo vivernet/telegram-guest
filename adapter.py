@@ -205,17 +205,23 @@ class GuestTelegramAdapter(telegram_base.TelegramAdapter):
                     "Отправь эту команду ответом на сообщение бота.",
                 )
                 return True
+
+            replied_text = str(getattr(replied, "text", "") or "").strip()
+            logger.info(
+                "[Telegram Guest] /del replied: msg_id=%s chat=%s guest_query_id=%r nested=%r",
+                getattr(replied, "message_id", None),
+                getattr(getattr(replied, "chat", None), "id", None),
+                getattr(replied, "guest_query_id", None),
+                (getattr(replied, "api_kwargs", None) or {}).get("guest_message"),
+            )
+
             # Гостевой ответ — inline-сообщение: править его можно только по
             # inline_message_id, а не по chat_id + message_id (бот не участник
-            # чата, такой запрос возвращает Forbidden). Ответ на гостевой
-            # пузырь несёт guest_query_id исходного запроса — по нему находим
-            # сохранённый inline_message_id именно этого сообщения, а не
-            # последнего пузыря сессии.
+            # чата, такой запрос возвращает Forbidden).
+            # 1) Точное совпадение по guest_query_id ответа (flat либо вложенный
+            #     guest_message внутри reply_to_message).
             replied_query_id = str(getattr(replied, "guest_query_id", "") or "").strip()
             if not replied_query_id:
-                # Telegram кладёт гостевой контекст ответа вложенным объектом
-                # guest_message внутри reply_to_message; PTB сохраняет его в
-                # api_kwargs.
                 _replied_guest = (getattr(replied, "api_kwargs", None) or {}).get(
                     "guest_message"
                 )
@@ -236,7 +242,30 @@ class GuestTelegramAdapter(telegram_base.TelegramAdapter):
                     inline_id = replied_query_id
                 await self._replace_guest_reply_with_ellipsis(inline_id, session_chat_id)
                 return True
-            # Цель не является гостевым ответом — попытка по chat_id + message_id.
+
+            # 2) Telegram не присылает guest_query_id в reply_to_message —
+            #     ищем сохранённый ответ с таким же контентом.
+            if replied_text:
+                candidates = [
+                    state
+                    for state in self._guest_queries.values()
+                    if state.inline_message_id
+                    and (state.delivered_content or state.latest_content) == replied_text
+                ]
+                if candidates:
+                    target = max(candidates, key=lambda state: state.created_mono)
+                    await self._replace_guest_reply_with_ellipsis(
+                        target.inline_message_id, session_chat_id
+                    )
+                    return True
+
+            # 3) Последний пузырь сессии — запасной вариант.
+            inline_id = self._last_guest_inline_id(session_chat_id)
+            if inline_id:
+                await self._replace_guest_reply_with_ellipsis(inline_id, session_chat_id)
+                return True
+
+            # 4) Цель не является гостевым ответом — попытка по chat_id + message_id.
             chat = getattr(message, "chat", None)
             real_chat_id = str(getattr(chat, "id", "") or "").strip()
             replied_msg_id = getattr(replied, "message_id", None)
@@ -261,11 +290,7 @@ class GuestTelegramAdapter(telegram_base.TelegramAdapter):
                         session_chat_id, "Не удалось очистить сообщение.",
                     )
                     return True
-            inline_id = self._last_guest_inline_id(session_chat_id)
-            if not inline_id:
-                await self._publish_guest(session_chat_id, "Не нашёл сообщение для удаления.")
-                return True
-            await self._replace_guest_reply_with_ellipsis(inline_id, session_chat_id)
+            await self._publish_guest(session_chat_id, "Не нашёл сообщение для удаления.")
             return True
         if cmd == "/status":
             await self._publish_guest(session_chat_id, self._guest_status_text(session_chat_id))

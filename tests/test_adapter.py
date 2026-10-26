@@ -1966,6 +1966,49 @@ async def test_command_delete_reads_nested_guest_message_query_id(adapter):
 
 
 @pytest.mark.asyncio
+async def test_command_delete_falls_back_to_text_match(adapter):
+    adapter.config.extra = {"allow_from": ["42"]}
+    def _make_test_event(message, message_type, update_id=None):
+        source = SessionSource(
+            platform=Platform.TELEGRAM,
+            chat_id="999",
+            chat_type="group",
+            user_id=str(getattr(getattr(message, "from_user", None), "id", "") or ""),
+        )
+        return SimpleNamespace(source=source, raw_message=message, text=message.text)
+
+    adapter._build_message_event = _make_test_event
+    adapter.handle_message = AsyncMock()
+
+    adapter._remember_guest_query("guest:999:42", "query-A")
+    adapter._guest_queries["guest:query-A"].inline_message_id = "inline-A"
+    adapter._guest_queries["guest:query-A"].delivered_content = "first answer"
+    adapter._remember_guest_query("guest:999:42", "query-B")
+    adapter._guest_queries["guest:query-B"].inline_message_id = "inline-B"
+    adapter._guest_queries["guest:query-B"].delivered_content = "second answer"
+
+    # Telegram не присылает guest_query_id в reply_to_message — сопоставляем
+    # по тексту.
+    reply_to = {
+        "message_id": 10,
+        "date": 0,
+        "chat": {"id": 999, "type": "group", "title": "Guest group"},
+        "from": {"id": 42, "is_bot": False, "first_name": "Roz"},
+        "text": "first answer",
+    }
+    delete_update = _guest_update(812, 999, 42, "@bot /del", "query-del", reply_to=reply_to)
+    await adapter._handle_guest_update(delete_update, None)
+
+    adapter.handle_message.assert_not_awaited()
+    del_calls = [
+        call for call in adapter._bot._post.await_args_list
+        if call.args[0] == "editMessageText" and call.args[1].get("text") == "..."
+    ]
+    assert len(del_calls) == 1
+    assert del_calls[0].args[1] == {"inline_message_id": "inline-A", "text": "..."}
+
+
+@pytest.mark.asyncio
 async def test_command_delete_without_reply_asks_for_reply(adapter):
     adapter.config.extra = {"allow_from": ["42"]}
     def _make_test_event(message, message_type, update_id=None):
