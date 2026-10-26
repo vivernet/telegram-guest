@@ -14,7 +14,6 @@ from telegram import (
     InlineQueryResultArticle,
     InputTextMessageContent,
     Message,
-    MessageEntity,
     Update,
 )
 from telegram.error import BadRequest
@@ -22,8 +21,7 @@ from telegram.ext import ApplicationHandlerStop, TypeHandler
 
 GUEST_UPDATE_TYPE = "guest_message"
 GUEST_CHAT_PREFIX = "guest:"
-GUEST_THINKING_TEXT = "✨ Думаю..."
-GUEST_THINKING_CUSTOM_EMOJI_ID = "5463297803235113601"
+GUEST_THINKING_TEXT = '<tg-emoji emoji-id="5467538555158943525">✨</tg-emoji> Думаю...'
 
 logger = logging.getLogger(__name__)
 
@@ -911,21 +909,15 @@ class GuestTelegramAdapter(telegram_base.TelegramAdapter):
                 time.monotonic() + self.ANSWER_ATTEMPT_RETENTION_SECONDS
             )
             result_id = hashlib.sha256(state.query_id.encode("utf-8")).hexdigest()[:32]
+            is_thinking = state.placeholder_active and text == GUEST_THINKING_TEXT
             result = InlineQueryResultArticle(
                 id=result_id,
                 title=getattr(self._bot, "first_name", None) or "Hermes",
                 input_message_content=InputTextMessageContent(
                     message_text=text,
-                    entities=(
-                        MessageEntity(
-                            type=MessageEntity.CUSTOM_EMOJI,
-                            offset=0,
-                            length=1,
-                            custom_emoji_id=GUEST_THINKING_CUSTOM_EMOJI_ID,
-                        ),
-                    )
-                    if state.placeholder_active and text == GUEST_THINKING_TEXT
-                    else (),
+                    parse_mode=(
+                        telegram_base.ParseMode.HTML if is_thinking else None
+                    ),
                 ),
             )
             try:

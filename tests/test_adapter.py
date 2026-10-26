@@ -1282,13 +1282,10 @@ async def test_guest_update_publishes_thinking_then_first_token_replaces_it(adap
         assert answer_call.args[0] == "answerGuestQuery"
         thinking_result = answer_call.args[1]["result"]
         thinking_content = thinking_result.input_message_content
-        assert thinking_content.message_text == "✨ Думаю..."
-        assert len(thinking_content.entities) == 1
-        emoji_entity = thinking_content.entities[0]
-        assert emoji_entity.type == "custom_emoji"
-        assert emoji_entity.offset == 0
-        assert emoji_entity.length == 1
-        assert emoji_entity.custom_emoji_id == "5463297803235113601"
+        assert thinking_content.message_text == (
+            '<tg-emoji emoji-id="5467538555158943525">✨</tg-emoji> Думаю...'
+        )
+        assert thinking_content.parse_mode == "HTML"
         await adapter.send(
             event.source.chat_id,
             "O",
