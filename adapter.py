@@ -763,22 +763,25 @@ class GuestTelegramAdapter(telegram_base.TelegramAdapter):
                         "inline_message_id": state.inline_message_id,
                         "text": text,
                     }
-                    if finalize:
-                        payload["text"] = self.format_message(text)
-                        payload["parse_mode"] = telegram_base.ParseMode.MARKDOWN_V2
+                    # Пробуем MarkdownV2 для любого редактирования (в т.ч. прогресс-блоков
+                    # вида "💻 terminal ``` ... ```"), чтобы markdown рендерился, а не
+                    # показывался сырьём с бэктиками. При сбое парсинга — фолбэк на plain.
+                    md_payload = dict(payload)
+                    md_payload["text"] = self.format_message(text)
+                    md_payload["parse_mode"] = telegram_base.ParseMode.MARKDOWN_V2
                     try:
                         raw_response = await self._bot._post(
                             "editMessageText",
-                            payload,
+                            md_payload,
                         )
                         state.delivered_finalized = finalize
                         state.delivered_rich_finalized = False
                     except Exception as format_exc:
-                        if not finalize or not isinstance(format_exc, BadRequest):
+                        if not isinstance(format_exc, BadRequest):
                             raise
                         if "not modified" in str(format_exc).lower():
                             raw_response = True
-                            state.delivered_finalized = True
+                            state.delivered_finalized = finalize
                             state.delivered_rich_finalized = False
                         else:
                             logger.warning(
@@ -790,16 +793,13 @@ class GuestTelegramAdapter(telegram_base.TelegramAdapter):
                             try:
                                 raw_response = await self._bot._post(
                                     "editMessageText",
-                                    {
-                                        "inline_message_id": state.inline_message_id,
-                                        "text": text,
-                                    },
+                                    payload,
                                 )
                             except BadRequest as plain_exc:
                                 if "not modified" not in str(plain_exc).lower():
                                     raise
                                 raw_response = True
-                            state.delivered_finalized = True
+                            state.delivered_finalized = finalize
                             state.delivered_rich_finalized = False
                 except Exception as exc:
                     raise GuestEditError(
