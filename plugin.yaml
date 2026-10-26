@@ -1,8 +1,10 @@
 name: telegram-guest
 label: Telegram Guest Mode
 kind: standalone
-version: 1.1.0
+version: 1.2.0
 description: >
   Adds native Telegram Guest Mode support through Hermes' platform-handler
   API and a thin delivery adapter. Normal Telegram traffic stays upstream.
+  Guest session history is persistent by default (real chat + caller) with
+  /clean and /del commands.
 author: Aster + Roz

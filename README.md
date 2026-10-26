@@ -54,6 +54,40 @@ key authorizes a channel profile used as the sender (`sender_chat`), while
 `guest_group_allow_from` authorizes the group in which the Guest mention occurs
 (`message.chat.id`).
 
+## Persistent guest sessions (default)
+
+Guest conversations are one-shot from Telegram's point of view: each mention is
+a separate `guest_query_id` with a single allowed reply. By default the plugin
+still gives a guest a *stable conversation history* by keying the Hermes session
+on the real chat + caller (and thread when present) instead of the one-shot
+query id. That means a guest who mentions the bot again in the same chat keeps
+the previous context, exactly like a normal private chat would.
+
+To opt out (behavior strictly per-query, no memory between mentions):
+
+```bash
+hermes config set --force platforms.telegram.extra.persistent_guest_sessions 'false'
+hermes gateway restart
+```
+
+The one-shot delivery is unchanged either way: each mention still gets its own
+`answerGuestQuery` reply. Persistent sessions accumulate records in the session
+store; use `/clean` to reset one explicitly.
+
+## Commands
+
+Guest mentions can carry bot commands. Because the bot is not a chat member,
+Telegram only delivers them when they include the `@mention` (or when the user
+replies to the bot's message). The plugin understands:
+
+- `@<bot> /clean` — reset the current guest session's history. Works without a
+  reply. The bot replies with a confirmation.
+- `@<bot> /del` / `@<bot> /delete` — sent **as a reply** to the bot's guest
+  message, this replaces the replied-to message's text with `...`. Telegram
+  guest replies are inline messages and cannot be deleted, so the plugin
+  "wipes" the text in place via `editMessageText`. If the command is not sent as
+  a reply, the bot asks for one.
+
 ## Updating
 
 ```bash

@@ -16,6 +16,8 @@ for path in (PLUGIN_DIR,):
         sys.path.insert(0, str(path))
 
 from gateway.platforms.base import SendResult
+from gateway.config import Platform
+from gateway.session import SessionSource
 from hermes_cli.plugins import PluginContext, PluginManager, PluginManifest
 from plugins.platforms.telegram import adapter as telegram_base
 
@@ -39,7 +41,10 @@ def adapter():
     )
     instance._guest_queries = {}
     instance._answer_attempted_query_ids = {}
+    instance._guest_session_last_query = {}
+    instance._guest_last_inline = {}
     instance._status_message_ids = {}
+    instance.config = SimpleNamespace(extra={}, home_channel=None)
     return instance
 
 
@@ -963,8 +968,12 @@ def test_register_uses_native_platform_handler_extension():
     assert callable(factory)
     ctx.register_platform.assert_called_once()
     platform_kwargs = ctx.register_platform.call_args.kwargs
-    assert platform_kwargs["env_overrides"]
-    assert platform_kwargs["env_enable_credentials"] == ("TELEGRAM_BOT_TOKEN",)
+    assert platform_kwargs["name"] == "telegram"
+    assert platform_kwargs["allowed_users_env"] == "TELEGRAM_ALLOWED_USERS"
+    assert platform_kwargs["allow_all_env"] == "TELEGRAM_ALLOW_ALL_USERS"
+    assert callable(platform_kwargs["adapter_factory"])
+    assert callable(platform_kwargs["check_fn"])
+    assert "TELEGRAM_BOT_TOKEN" in platform_kwargs["required_env"]
 
 
 def test_native_factory_does_not_mutate_ptb_update_types(adapter):
@@ -1217,11 +1226,16 @@ def test_guest_handler_installation_is_fail_closed(adapter):
 @pytest.mark.asyncio
 async def test_guest_update_is_dispatched_on_synthetic_chat(adapter, monkeypatch):
     adapter.config = SimpleNamespace(extra={"allow_from": ["42"]})
-    adapter._build_message_event = lambda message, message_type, update_id=None: SimpleNamespace(
-        source=SimpleNamespace(chat_id="999", chat_type="group"),
-        raw_message=message,
-        text=message.text,
-    )
+    def _make_test_event(message, message_type, update_id=None):
+        source = SessionSource(
+            platform=Platform.TELEGRAM,
+            chat_id="999",
+            chat_type="group",
+            user_id=str(getattr(getattr(message, "from_user", None), "id", "") or ""),
+        )
+        return SimpleNamespace(source=source, raw_message=message, text=message.text)
+
+    adapter._build_message_event = _make_test_event
     adapter.handle_message = AsyncMock()
     update = SimpleNamespace(
         update_id=77,
@@ -1241,7 +1255,7 @@ async def test_guest_update_is_dispatched_on_synthetic_chat(adapter, monkeypatch
 
     adapter.handle_message.assert_awaited_once()
     event = adapter.handle_message.await_args.args[0]
-    assert event.source.chat_id == "guest:query-77"
+    assert event.source.chat_id == "guest:999:42"
     assert event.source.chat_type == "guest"
     assert event.text == "@aster oi"
     assert adapter._guest_queries["guest:query-77"].query_id == "query-77"
@@ -1250,11 +1264,16 @@ async def test_guest_update_is_dispatched_on_synthetic_chat(adapter, monkeypatch
 @pytest.mark.asyncio
 async def test_guest_update_publishes_thinking_then_first_token_replaces_it(adapter):
     adapter.config = SimpleNamespace(extra={"allow_from": ["42"]})
-    adapter._build_message_event = lambda message, message_type, update_id=None: SimpleNamespace(
-        source=SimpleNamespace(chat_id="999", chat_type="group"),
-        raw_message=message,
-        text=message.text,
-    )
+    def _make_test_event(message, message_type, update_id=None):
+        source = SessionSource(
+            platform=Platform.TELEGRAM,
+            chat_id="999",
+            chat_type="group",
+            user_id=str(getattr(getattr(message, "from_user", None), "id", "") or ""),
+        )
+        return SimpleNamespace(source=source, raw_message=message, text=message.text)
+
+    adapter._build_message_event = _make_test_event
 
     async def handle_message(event):
         answer_call = adapter._bot._post.await_args_list[0]
@@ -1303,11 +1322,16 @@ async def test_guest_update_publishes_thinking_then_first_token_replaces_it(adap
 @pytest.mark.asyncio
 async def test_duplicate_guest_update_does_not_restore_thinking_or_redispatch(adapter):
     adapter.config = SimpleNamespace(extra={"allow_from": ["42"]})
-    adapter._build_message_event = lambda message, message_type, update_id=None: SimpleNamespace(
-        source=SimpleNamespace(chat_id="999", chat_type="group"),
-        raw_message=message,
-        text=message.text,
-    )
+    def _make_test_event(message, message_type, update_id=None):
+        source = SessionSource(
+            platform=Platform.TELEGRAM,
+            chat_id="999",
+            chat_type="group",
+            user_id=str(getattr(getattr(message, "from_user", None), "id", "") or ""),
+        )
+        return SimpleNamespace(source=source, raw_message=message, text=message.text)
+
+    adapter._build_message_event = _make_test_event
     dispatches = 0
 
     async def handle_message(event):
@@ -1351,11 +1375,16 @@ async def test_duplicate_guest_update_does_not_restore_thinking_or_redispatch(ad
 @pytest.mark.asyncio
 async def test_native_ptb_guest_update_is_dispatched_and_stops_normal_handlers(adapter):
     adapter.config = SimpleNamespace(extra={"allow_from": ["42"]})
-    adapter._build_message_event = lambda message, message_type, update_id=None: SimpleNamespace(
-        source=SimpleNamespace(chat_id="999", chat_type="group"),
-        raw_message=message,
-        text=message.text,
-    )
+    def _make_test_event(message, message_type, update_id=None):
+        source = SessionSource(
+            platform=Platform.TELEGRAM,
+            chat_id="999",
+            chat_type="group",
+            user_id=str(getattr(getattr(message, "from_user", None), "id", "") or ""),
+        )
+        return SimpleNamespace(source=source, raw_message=message, text=message.text)
+
+    adapter._build_message_event = _make_test_event
     adapter.handle_message = AsyncMock()
     update = Update.de_json(
         {
@@ -1376,7 +1405,7 @@ async def test_native_ptb_guest_update_is_dispatched_and_stops_normal_handlers(a
 
     adapter.handle_message.assert_awaited_once()
     event = adapter.handle_message.await_args.args[0]
-    assert event.source.chat_id == "guest:query-81"
+    assert event.source.chat_id == "guest:999:42"
     assert adapter._guest_queries["guest:query-81"].query_id == "query-81"
 
 
@@ -1734,3 +1763,144 @@ def test_guest_query_state_is_bounded(adapter):
     adapter._remember_guest_query("guest:three", "three")
 
     assert set(adapter._guest_queries) == {"guest:two", "guest:three"}
+
+
+# --- Persistent session + guest commands -------------------------------------
+
+def _guest_update(update_id, chat_id, caller_id, text, query_id, reply_to=None):
+    raw = {
+        "update_id": update_id,
+        "api_kwargs": {
+            "guest_message": {
+                "message_id": update_id,
+                "date": 0,
+                "chat": {"id": chat_id, "type": "group", "title": "Guest group"},
+                "from": {"id": caller_id, "is_bot": False, "first_name": "Roz"},
+                "text": text,
+                "guest_query_id": query_id,
+            }
+        },
+    }
+    if reply_to is not None:
+        raw["api_kwargs"]["guest_message"]["reply_to_message"] = reply_to
+    return SimpleNamespace(**raw)
+
+
+def test_persistent_guest_session_uses_real_chat_and_caller(adapter):
+    assert (
+        adapter._guest_session_chat_id(
+            SimpleNamespace(
+                chat=SimpleNamespace(id="-100999", type="supergroup"),
+                from_user=SimpleNamespace(id=42),
+            ),
+            "query-1",
+        )
+        == "guest:-100999:42"
+    )
+
+
+def test_legacy_guest_session_when_disabled(adapter):
+    adapter.config.extra = {"persistent_guest_sessions": False}
+    message = SimpleNamespace(
+        chat=SimpleNamespace(id="-100999", type="supergroup"),
+        from_user=SimpleNamespace(id=42),
+    )
+    assert adapter._guest_session_chat_id(message, "query-1") == "guest:query-1"
+
+
+@pytest.mark.asyncio
+async def test_command_clean_resets_session_and_publishes_confirmation(adapter):
+    adapter.config.extra = {"allow_from": ["42"]}
+    def _make_test_event(message, message_type, update_id=None):
+        source = SessionSource(
+            platform=Platform.TELEGRAM,
+            chat_id="999",
+            chat_type="group",
+            user_id=str(getattr(getattr(message, "from_user", None), "id", "") or ""),
+        )
+        return SimpleNamespace(source=source, raw_message=message, text=message.text)
+
+    adapter._build_message_event = _make_test_event
+    adapter.handle_message = AsyncMock()
+    adapter._session_store = MagicMock()
+    adapter._session_store.reset_session = MagicMock(return_value=object())
+
+    update = _guest_update(700, 999, 42, "@bot /clean", "query-clean")
+    await adapter._handle_guest_update(update, None)
+
+    adapter.handle_message.assert_not_awaited()
+    adapter._session_store.reset_session.assert_called_once()
+    session_key = adapter._session_store.reset_session.call_args.args[0]
+    assert "telegram" in session_key
+    calls = [call.args[0] for call in adapter._bot._post.await_args_list]
+    assert calls == ["answerGuestQuery"]
+    payload = adapter._bot._post.await_args.args[1]
+    assert payload["result"].input_message_content.message_text == "✅ Сессия очищена."
+
+
+@pytest.mark.asyncio
+async def test_command_delete_replaces_target_inline_with_ellipsis(adapter):
+    adapter.config.extra = {"allow_from": ["42"]}
+    def _make_test_event(message, message_type, update_id=None):
+        source = SessionSource(
+            platform=Platform.TELEGRAM,
+            chat_id="999",
+            chat_type="group",
+            user_id=str(getattr(getattr(message, "from_user", None), "id", "") or ""),
+        )
+        return SimpleNamespace(source=source, raw_message=message, text=message.text)
+
+    adapter._build_message_event = _make_test_event
+    adapter.handle_message = AsyncMock()
+
+    # first tour: answer a normal guest question, remember the inline message
+    first = _guest_update(701, 999, 42, "@bot hi", "query-1")
+    await adapter._handle_guest_update(first, None)
+    adapter._bot._post = AsyncMock(return_value={"inline_message_id": "guest-inline-1"})
+    adapter.handle_message = AsyncMock()
+    await adapter.send("guest:999:42", "previous answer", metadata={"notify": True})
+
+    # second tour: /del reply -> should edit the remembered inline message
+    reply_to = {
+        "message_id": 10,
+        "date": 0,
+        "chat": {"id": 999, "type": "group", "title": "Guest group"},
+        "from": {"id": 42, "is_bot": False, "first_name": "Roz"},
+        "text": "previous answer",
+    }
+    delete_update = _guest_update(702, 999, 42, "@bot /del", "query-2", reply_to=reply_to)
+    await adapter._handle_guest_update(delete_update, None)
+
+    adapter.handle_message.assert_not_awaited()
+    edit_calls = [
+        call for call in adapter._bot._post.await_args_list
+        if call.args[0] == "editMessageText"
+    ]
+    assert len(edit_calls) == 2  # finalize of the remembered reply + the /del wipe
+    del_payload = edit_calls[-1].args[1]
+    assert del_payload == {"inline_message_id": "guest-inline-1", "text": "..."}
+
+
+@pytest.mark.asyncio
+async def test_command_delete_without_reply_asks_for_reply(adapter):
+    adapter.config.extra = {"allow_from": ["42"]}
+    def _make_test_event(message, message_type, update_id=None):
+        source = SessionSource(
+            platform=Platform.TELEGRAM,
+            chat_id="999",
+            chat_type="group",
+            user_id=str(getattr(getattr(message, "from_user", None), "id", "") or ""),
+        )
+        return SimpleNamespace(source=source, raw_message=message, text=message.text)
+
+    adapter._build_message_event = _make_test_event
+    adapter.handle_message = AsyncMock()
+
+    update = _guest_update(703, 999, 42, "@bot /del", "query-3")
+    await adapter._handle_guest_update(update, None)
+
+    adapter.handle_message.assert_not_awaited()
+    payload = adapter._bot._post.await_args.args[1]
+    assert payload["result"].input_message_content.message_text == (
+        "Отправь эту команду ответом на сообщение бота."
+    )

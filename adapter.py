@@ -77,16 +77,34 @@ class GuestTelegramAdapter(telegram_base.TelegramAdapter):
         super().__init__(config)
         self._guest_queries: dict[str, GuestQueryState] = {}
         self._answer_attempted_query_ids: dict[str, float] = {}
+        self._guest_session_last_query: dict[str, str] = {}
+        self._guest_last_inline: dict[str, str] = {}
         self._guest_handler_apps: set[int] = set()
 
-    def _remember_guest_query(self, chat_id: str, query_id: str) -> GuestQueryState:
+    def _remember_guest_query(self, session_chat_id: str, query_id: str) -> GuestQueryState:
+        """Track a guest query under its one-shot key while keeping the session stable.
+
+        ``session_chat_id`` is the synthetic identity Hermes uses for history —
+        either the legacy query-scoped id or a persistent ``guest:<chat>:<caller>``
+        key. Delivery state stays keyed by the unique query id so each mention gets
+        its own ``answerGuestQuery`` round, while ``_guest_session_last_query`` maps
+        the session to its latest query (used to route sends and to find the last
+        inline reply for /del).
+        """
         now = time.monotonic()
         while self._answer_attempted_query_ids:
             retained_id = next(iter(self._answer_attempted_query_ids))
             if self._answer_attempted_query_ids[retained_id] > now:
                 break
             self._answer_attempted_query_ids.pop(retained_id, None)
-        state = self._guest_queries.get(chat_id)
+        state_key = guest_chat_id(query_id)
+        previous_query_id = self._guest_session_last_query.get(session_chat_id)
+        if previous_query_id and previous_query_id != query_id:
+            previous = self._guest_queries.get(guest_chat_id(previous_query_id))
+            if previous is not None and previous.inline_message_id:
+                self._guest_last_inline[session_chat_id] = previous.inline_message_id
+        self._guest_session_last_query[session_chat_id] = query_id
+        state = self._guest_queries.get(state_key)
         if state is None:
             if len(self._guest_queries) >= self.MAX_RETAINED_QUERIES:
                 self._guest_queries.pop(next(iter(self._guest_queries)))
@@ -94,8 +112,96 @@ class GuestTelegramAdapter(telegram_base.TelegramAdapter):
                 query_id=query_id,
                 answer_attempted=query_id in self._answer_attempted_query_ids,
             )
-            self._guest_queries[chat_id] = state
+            self._guest_queries[state_key] = state
         return state
+
+    def _guest_session_chat_id(self, message: Message, query_id: str) -> str:
+        """Stable session identity for a guest mention.
+
+        Persistent mode (default) keys history on the real chat + caller IDs so a
+        guest keeps context across mentions; the one-shot delivery still runs per
+        ``guest_query_id``. Set ``extra.persistent_guest_sessions=false`` to fall
+        back to the legacy one-shot query-scoped behaviour.
+        """
+        extra = getattr(self.config, "extra", None) or {}
+        if not extra.get("persistent_guest_sessions", True):
+            return guest_chat_id(query_id)
+        chat = getattr(message, "chat", None)
+        real_chat_id = str(getattr(chat, "id", "") or "").strip()
+        caller = getattr(message, "sender_chat", None) or getattr(message, "from_user", None)
+        caller_id = str(getattr(caller, "id", "") or "").strip()
+        if not real_chat_id or not caller_id:
+            return guest_chat_id(query_id)
+        return f"{GUEST_CHAT_PREFIX}{real_chat_id}:{caller_id}"
+
+    @staticmethod
+    def _guest_command(text: str) -> str | None:
+        cleaned = (text or "").strip()
+        # Telegram requires a @mention to reach a guest bot in a group; strip
+        # any leading "@handle" so both "/clean" and "@bot /clean" work.
+        while cleaned.startswith("@"):
+            _, sep, rest = cleaned.partition(" ")
+            if not sep:
+                cleaned = ""
+                break
+            cleaned = rest.strip()
+        lower = cleaned.lower()
+        if lower == "/clean":
+            return "/clean"
+        if lower in ("/del", "/delete"):
+            return "/del"
+        return None
+
+    def _last_guest_inline_id(self, session_chat_id: str) -> str | None:
+        query_id = self._guest_session_last_query.get(session_chat_id)
+        if query_id:
+            state = self._guest_queries.get(guest_chat_id(query_id))
+            if state is not None and state.inline_message_id:
+                return state.inline_message_id
+        return self._guest_last_inline.get(session_chat_id)
+
+    async def _replace_guest_reply_with_ellipsis(
+        self, inline_id: str, session_chat_id: str,
+    ) -> None:
+        try:
+            await self._bot._post(
+                "editMessageText",
+                {"inline_message_id": inline_id, "text": "..."},
+            )
+            await self._publish_guest(session_chat_id, "🗑 Сообщение очищено.")
+        except Exception:
+            logger.warning("[Telegram Guest] /del inline edit failed", exc_info=True)
+            await self._publish_guest(session_chat_id, "Не удалось очистить сообщение.")
+
+    async def _dispatch_guest_command(
+        self, cmd: str, message: Message, session_chat_id: str, event: Any,
+    ) -> bool:
+        if cmd == "/clean":
+            store = getattr(self, "_session_store", None)
+            if store is not None:
+                try:
+                    session_key = self._event_session_key(event)
+                    if session_key:
+                        store.reset_session(session_key)
+                except Exception:
+                    logger.warning("[Telegram Guest] /clean session reset failed", exc_info=True)
+            await self._publish_guest(session_chat_id, "✅ Сессия очищена.")
+            return True
+        if cmd == "/del":
+            replied = getattr(message, "reply_to_message", None)
+            if replied is None:
+                await self._publish_guest(
+                    session_chat_id,
+                    "Отправь эту команду ответом на сообщение бота.",
+                )
+                return True
+            inline_id = self._last_guest_inline_id(session_chat_id)
+            if not inline_id:
+                await self._publish_guest(session_chat_id, "Не нашёл сообщение для удаления.")
+                return True
+            await self._replace_guest_reply_with_ellipsis(inline_id, session_chat_id)
+            return True
+        return False
 
     def _ensure_guest_handler(self, app) -> bool:
         """Install the catch-all guest handler without risking normal Telegram."""
@@ -343,22 +449,12 @@ class GuestTelegramAdapter(telegram_base.TelegramAdapter):
             )
             return
 
-        synthetic_chat_id = guest_chat_id(query_id)
-        state = self._remember_guest_query(synthetic_chat_id, query_id)
+        session_chat_id = self._guest_session_chat_id(message, query_id)
+        state = self._remember_guest_query(session_chat_id, query_id)
         if state.answer_attempted:
             logger.info(
                 "[Telegram Guest] Ignoring duplicate query=%s",
                 hashlib.sha256(query_id.encode("utf-8")).hexdigest()[:8],
-            )
-            return
-        state.placeholder_active = True
-        thinking = await self._publish_guest(synthetic_chat_id, GUEST_THINKING_TEXT)
-        if not thinking.success:
-            state.placeholder_active = False
-            logger.warning(
-                "[Telegram Guest] Could not publish initial thinking response query=%s: %s",
-                hashlib.sha256(query_id.encode("utf-8")).hexdigest()[:8],
-                thinking.error or "unknown error",
             )
             return
 
@@ -368,8 +464,34 @@ class GuestTelegramAdapter(telegram_base.TelegramAdapter):
             update_id=getattr(update, "update_id", None),
         )
         event.text = prompt
-        event.source.chat_id = synthetic_chat_id
+        event.source.chat_id = session_chat_id
         event.source.chat_type = "guest"
+        caller = getattr(message, "sender_chat", None) or getattr(message, "from_user", None)
+        if getattr(caller, "id", None) is not None:
+            event.source.user_id = str(caller.id)
+        thread_id_raw = getattr(message, "message_thread_id", None)
+        if thread_id_raw is not None and getattr(event.source, "thread_id", None) is None:
+            event.source.thread_id = str(thread_id_raw)
+
+        command = self._guest_command(self._clean_bot_trigger_text(prompt))
+        if command:
+            handled = await self._dispatch_guest_command(
+                command, message, session_chat_id, event,
+            )
+            if handled:
+                return
+
+        state.placeholder_active = True
+        thinking = await self._publish_guest(session_chat_id, GUEST_THINKING_TEXT)
+        if not thinking.success:
+            state.placeholder_active = False
+            logger.warning(
+                "[Telegram Guest] Could not publish initial thinking response query=%s: %s",
+                hashlib.sha256(query_id.encode("utf-8")).hexdigest()[:8],
+                thinking.error or "unknown error",
+            )
+            return
+
         await self._enrich_guest_direct(message, event)
         await self._enrich_guest_reply(message, event)
         await self.handle_message(event)
@@ -437,6 +559,12 @@ class GuestTelegramAdapter(telegram_base.TelegramAdapter):
         turn_final: bool = False,
     ) -> SendResult:
         state = self._guest_queries.get(chat_id)
+        if state is None:
+            # Stable-session sends arrive with the session key, not the one-shot
+            # query key; resolve through the session -> latest query map.
+            query_id = self._guest_session_last_query.get(chat_id)
+            if query_id:
+                state = self._guest_queries.get(guest_chat_id(query_id))
         if state is None:
             return SendResult(success=False, error="Unknown guest query")
         query_ref = hashlib.sha256(state.query_id.encode("utf-8")).hexdigest()[:8]
@@ -677,6 +805,15 @@ class GuestTelegramAdapter(telegram_base.TelegramAdapter):
             return self.GUEST_STREAM_CONSUMER_LIMIT
         return super().max_message_length_for_chat(chat_id)
 
+    def _resolve_guest_state(self, chat_id: str) -> GuestQueryState | None:
+        state = self._guest_queries.get(str(chat_id))
+        if state is not None:
+            return state
+        query_id = self._guest_session_last_query.get(str(chat_id))
+        if query_id:
+            return self._guest_queries.get(guest_chat_id(query_id))
+        return None
+
     async def send(
         self,
         chat_id: str,
@@ -687,9 +824,6 @@ class GuestTelegramAdapter(telegram_base.TelegramAdapter):
         if not is_guest_chat_id(chat_id):
             return await super().send(chat_id, content, reply_to=reply_to, metadata=metadata)
 
-        state = self._guest_queries.get(str(chat_id))
-        if state is None:
-            return SendResult(success=False, error="Unknown guest query")
         marked_visible = bool(
             metadata and (metadata.get("expect_edits") or metadata.get("notify"))
         )
@@ -718,8 +852,7 @@ class GuestTelegramAdapter(telegram_base.TelegramAdapter):
                 content,
                 metadata=metadata,
             )
-        state = self._guest_queries.get(str(chat_id))
-        if state is None:
+        if self._resolve_guest_state(chat_id) is None:
             return SendResult(success=False, error="Unknown guest query")
         return SendResult(success=True)
 
