@@ -212,6 +212,17 @@ class GuestTelegramAdapter(telegram_base.TelegramAdapter):
             # сохранённый inline_message_id именно этого сообщения, а не
             # последнего пузыря сессии.
             replied_query_id = str(getattr(replied, "guest_query_id", "") or "").strip()
+            if not replied_query_id:
+                # Telegram кладёт гостевой контекст ответа вложенным объектом
+                # guest_message внутри reply_to_message; PTB сохраняет его в
+                # api_kwargs.
+                _replied_guest = (getattr(replied, "api_kwargs", None) or {}).get(
+                    "guest_message"
+                )
+                if isinstance(_replied_guest, dict):
+                    replied_query_id = str(
+                        _replied_guest.get("guest_query_id") or ""
+                    ).strip()
             if replied_query_id:
                 target_state = self._guest_queries.get(guest_chat_id(replied_query_id))
                 inline_id = (

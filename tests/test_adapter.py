@@ -1926,6 +1926,46 @@ async def test_command_delete_edits_exact_replied_bubble_not_last(adapter):
 
 
 @pytest.mark.asyncio
+async def test_command_delete_reads_nested_guest_message_query_id(adapter):
+    adapter.config.extra = {"allow_from": ["42"]}
+    def _make_test_event(message, message_type, update_id=None):
+        source = SessionSource(
+            platform=Platform.TELEGRAM,
+            chat_id="999",
+            chat_type="group",
+            user_id=str(getattr(getattr(message, "from_user", None), "id", "") or ""),
+        )
+        return SimpleNamespace(source=source, raw_message=message, text=message.text)
+
+    adapter._build_message_event = _make_test_event
+    adapter.handle_message = AsyncMock()
+
+    adapter._remember_guest_query("guest:999:42", "query-old")
+    adapter._guest_queries["guest:query-old"].inline_message_id = "inline-old"
+
+    # Телеграм отдаёт гостевой контекст вложенным guest_message внутри
+    # reply_to_message (flat guest_query_id отсутствует).
+    reply_to = {
+        "message_id": 10,
+        "date": 0,
+        "chat": {"id": 999, "type": "group", "title": "Guest group"},
+        "from": {"id": 42, "is_bot": False, "first_name": "Roz"},
+        "text": "old answer",
+        "guest_message": {"guest_query_id": "query-old", "text": "old answer"},
+    }
+    delete_update = _guest_update(811, 999, 42, "@bot /del", "query-del", reply_to=reply_to)
+    await adapter._handle_guest_update(delete_update, None)
+
+    adapter.handle_message.assert_not_awaited()
+    del_calls = [
+        call for call in adapter._bot._post.await_args_list
+        if call.args[0] == "editMessageText" and call.args[1].get("text") == "..."
+    ]
+    assert len(del_calls) == 1
+    assert del_calls[0].args[1] == {"inline_message_id": "inline-old", "text": "..."}
+
+
+@pytest.mark.asyncio
 async def test_command_delete_without_reply_asks_for_reply(adapter):
     adapter.config.extra = {"allow_from": ["42"]}
     def _make_test_event(message, message_type, update_id=None):
