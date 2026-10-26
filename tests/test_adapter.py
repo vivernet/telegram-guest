@@ -1280,7 +1280,7 @@ async def test_guest_update_publishes_thinking_then_first_token_replaces_it(adap
         assert answer_call.args[0] == "answerGuestQuery"
         thinking_result = answer_call.args[1]["result"]
         thinking_content = thinking_result.input_message_content
-        assert thinking_content.message_text == "✨ Thinking"
+        assert thinking_content.message_text == "✨ Думаю..."
         assert len(thinking_content.entities) == 1
         emoji_entity = thinking_content.entities[0]
         assert emoji_entity.type == "custom_emoji"

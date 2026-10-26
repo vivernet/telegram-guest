@@ -22,7 +22,7 @@ from telegram.ext import ApplicationHandlerStop, TypeHandler
 
 GUEST_UPDATE_TYPE = "guest_message"
 GUEST_CHAT_PREFIX = "guest:"
-GUEST_THINKING_TEXT = "✨ Thinking"
+GUEST_THINKING_TEXT = "✨ Думаю..."
 GUEST_THINKING_CUSTOM_EMOJI_ID = "5463297803235113601"
 
 logger = logging.getLogger(__name__)
