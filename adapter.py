@@ -205,9 +205,27 @@ class GuestTelegramAdapter(telegram_base.TelegramAdapter):
                     "Отправь эту команду ответом на сообщение бота.",
                 )
                 return True
-            # Приоритет: очистить именно то сообщение, на которое ответил
-            # пользователь, а не последний пузырь сессии. Гостевые ответы —
-            # inline-сообщения, их можно редактировать и по chat_id + message_id.
+            # Гостевой ответ — inline-сообщение: править его можно только по
+            # inline_message_id, а не по chat_id + message_id (бот не участник
+            # чата, такой запрос возвращает Forbidden). Ответ на гостевой
+            # пузырь несёт guest_query_id исходного запроса — по нему находим
+            # сохранённый inline_message_id именно этого сообщения, а не
+            # последнего пузыря сессии.
+            replied_query_id = str(getattr(replied, "guest_query_id", "") or "").strip()
+            if replied_query_id:
+                target_state = self._guest_queries.get(guest_chat_id(replied_query_id))
+                inline_id = (
+                    target_state.inline_message_id
+                    if target_state is not None
+                    else None
+                )
+                # Если запись уже вытеснена/устарела — пробуем сам guest_query_id
+                # как inline_message_id (запасной вариант).
+                if inline_id is None:
+                    inline_id = replied_query_id
+                await self._replace_guest_reply_with_ellipsis(inline_id, session_chat_id)
+                return True
+            # Цель не является гостевым ответом — попытка по chat_id + message_id.
             chat = getattr(message, "chat", None)
             real_chat_id = str(getattr(chat, "id", "") or "").strip()
             replied_msg_id = getattr(replied, "message_id", None)

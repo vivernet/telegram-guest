@@ -43,6 +43,7 @@ def adapter():
     instance._answer_attempted_query_ids = {}
     instance._guest_session_last_query = {}
     instance._guest_last_inline = {}
+    instance._guest_busy = {}
     instance._status_message_ids = {}
     instance.config = SimpleNamespace(extra={}, home_channel=None)
     return instance
@@ -1867,6 +1868,7 @@ async def test_command_delete_replaces_target_inline_with_ellipsis(adapter):
         "chat": {"id": 999, "type": "group", "title": "Guest group"},
         "from": {"id": 42, "is_bot": False, "first_name": "Roz"},
         "text": "previous answer",
+        "guest_query_id": "query-1",
     }
     delete_update = _guest_update(702, 999, 42, "@bot /del", "query-2", reply_to=reply_to)
     await adapter._handle_guest_update(delete_update, None)
@@ -1879,6 +1881,48 @@ async def test_command_delete_replaces_target_inline_with_ellipsis(adapter):
     assert len(edit_calls) == 2  # finalize of the remembered reply + the /del wipe
     del_payload = edit_calls[-1].args[1]
     assert del_payload == {"inline_message_id": "guest-inline-1", "text": "..."}
+
+
+@pytest.mark.asyncio
+async def test_command_delete_edits_exact_replied_bubble_not_last(adapter):
+    adapter.config.extra = {"allow_from": ["42"]}
+    def _make_test_event(message, message_type, update_id=None):
+        source = SessionSource(
+            platform=Platform.TELEGRAM,
+            chat_id="999",
+            chat_type="group",
+            user_id=str(getattr(getattr(message, "from_user", None), "id", "") or ""),
+        )
+        return SimpleNamespace(source=source, raw_message=message, text=message.text)
+
+    adapter._build_message_event = _make_test_event
+    adapter.handle_message = AsyncMock()
+
+    # Two prior answers in one session; /del targets the OLD bubble via its
+    # guest_query_id, not the last bubble of the session.
+    adapter._remember_guest_query("guest:999:42", "query-old")
+    adapter._guest_queries["guest:query-old"].inline_message_id = "inline-old"
+    adapter._remember_guest_query("guest:999:42", "query-new")
+    adapter._guest_queries["guest:query-new"].inline_message_id = "inline-new"
+
+    reply_to = {
+        "message_id": 10,
+        "date": 0,
+        "chat": {"id": 999, "type": "group", "title": "Guest group"},
+        "from": {"id": 42, "is_bot": False, "first_name": "Roz"},
+        "text": "old answer",
+        "guest_query_id": "query-old",
+    }
+    delete_update = _guest_update(810, 999, 42, "@bot /del", "query-del", reply_to=reply_to)
+    await adapter._handle_guest_update(delete_update, None)
+
+    adapter.handle_message.assert_not_awaited()
+    del_calls = [
+        call for call in adapter._bot._post.await_args_list
+        if call.args[0] == "editMessageText" and call.args[1].get("text") == "..."
+    ]
+    assert len(del_calls) == 1
+    assert del_calls[0].args[1] == {"inline_message_id": "inline-old", "text": "..."}
 
 
 @pytest.mark.asyncio
