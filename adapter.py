@@ -53,6 +53,7 @@ class GuestQueryState:
     answer_error: str | None = None
     answered: bool = False
     inline_message_id: str | None = None
+    answered_wallclock: float | None = None
     placeholder_active: bool = False
     created_mono: float = field(default_factory=time.monotonic)
     answer_lock: asyncio.Lock = field(default_factory=asyncio.Lock, repr=False)
@@ -83,6 +84,7 @@ class GuestTelegramAdapter(telegram_base.TelegramAdapter):
         self._guest_queries: dict[str, GuestQueryState] = {}
         self._answer_attempted_query_ids: dict[str, float] = {}
         self._guest_session_last_query: dict[str, str] = {}
+        self._guest_session_queries: dict[str, list[str]] = {}
         self._guest_last_inline: dict[str, str] = {}
         self._guest_busy: dict[str, bool] = {}
         self._guest_handler_apps: set[int] = set()
@@ -110,6 +112,11 @@ class GuestTelegramAdapter(telegram_base.TelegramAdapter):
             if previous is not None and previous.inline_message_id:
                 self._guest_last_inline[session_chat_id] = previous.inline_message_id
         self._guest_session_last_query[session_chat_id] = query_id
+        ledger = self._guest_session_queries.setdefault(session_chat_id, [])
+        if not ledger or ledger[-1] != query_id:
+            ledger.append(query_id)
+        if len(ledger) > self.MAX_RETAINED_QUERIES:
+            del ledger[: len(ledger) - self.MAX_RETAINED_QUERIES]
         state = self._guest_queries.get(state_key)
         if state is None:
             if len(self._guest_queries) >= self.MAX_RETAINED_QUERIES:
@@ -243,21 +250,44 @@ class GuestTelegramAdapter(telegram_base.TelegramAdapter):
                 await self._replace_guest_reply_with_ellipsis(inline_id, session_chat_id)
                 return True
 
-            # 2) Telegram не присылает guest_query_id в reply_to_message —
-            #     ищем сохранённый ответ с таким же контентом.
-            if replied_text:
-                candidates = [
-                    state
-                    for state in self._guest_queries.values()
-                    if state.inline_message_id
-                    and (state.delivered_content or state.latest_content) == replied_text
+            # 2) Telegram не присылает guest_query_id в reply_to_message. Ищем
+            #     целевой пузырь внутри этой сессии по дате отправки и/или по
+            #     тексту (чаще всего пользователь отвечает на последний видимый
+            #     ответ бота).
+            replied_ts = getattr(getattr(replied, "date", None), "timestamp", None)
+            replied_ts = replied_ts() if replied_ts is not None else None
+
+            def _session_states():
+                for query_id in self._guest_session_queries.get(session_chat_id, []):
+                    st = self._guest_queries.get(guest_chat_id(query_id))
+                    if st is not None and st.inline_message_id:
+                        yield st
+
+            matched = None
+            if replied_ts is not None:
+                timed = [
+                    st
+                    for st in _session_states()
+                    if st.answered_wallclock is not None
+                    and abs(st.answered_wallclock - replied_ts) <= 5
                 ]
-                if candidates:
-                    target = max(candidates, key=lambda state: state.created_mono)
-                    await self._replace_guest_reply_with_ellipsis(
-                        target.inline_message_id, session_chat_id
+                if timed:
+                    matched = min(
+                        timed, key=lambda s: abs(s.answered_wallclock - replied_ts)
                     )
-                    return True
+            if matched is None and replied_text:
+                textual = [
+                    st
+                    for st in _session_states()
+                    if (st.delivered_content or st.latest_content) == replied_text
+                ]
+                if textual:
+                    matched = max(textual, key=lambda s: s.created_mono)
+            if matched is not None:
+                await self._replace_guest_reply_with_ellipsis(
+                    matched.inline_message_id, session_chat_id
+                )
+                return True
 
             # 3) Последний пузырь сессии — запасной вариант.
             inline_id = self._last_guest_inline_id(session_chat_id)
@@ -914,6 +944,7 @@ class GuestTelegramAdapter(telegram_base.TelegramAdapter):
                 )
 
             state.answered = True
+            state.answered_wallclock = time.time()
             inline_message_id = None
             if isinstance(raw_response, dict):
                 inline_message_id = raw_response.get("inline_message_id")
