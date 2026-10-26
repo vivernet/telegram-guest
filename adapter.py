@@ -185,7 +185,6 @@ class GuestTelegramAdapter(telegram_base.TelegramAdapter):
                 "editMessageText",
                 {"inline_message_id": inline_id, "text": "..."},
             )
-            await self._publish_guest(session_chat_id, "🗑 Сообщение очищено.")
         except Exception:
             logger.warning("[Telegram Guest] /del inline edit failed", exc_info=True)
             await self._publish_guest(session_chat_id, "Не удалось очистить сообщение.")
@@ -309,7 +308,6 @@ class GuestTelegramAdapter(telegram_base.TelegramAdapter):
                             "text": "...",
                         },
                     )
-                    await self._publish_guest(session_chat_id, "🗑 Сообщение очищено.")
                     return True
                 except Exception:
                     logger.warning(
