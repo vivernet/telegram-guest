@@ -21,7 +21,7 @@ from telegram.ext import ApplicationHandlerStop, TypeHandler
 
 GUEST_UPDATE_TYPE = "guest_message"
 GUEST_CHAT_PREFIX = "guest:"
-GUEST_THINKING_TEXT = '<tg-emoji emoji-id="5467538555158943525">✨</tg-emoji> Думаю...'
+GUEST_THINKING_TEXT = '<tg-emoji emoji-id="5463297803235113601">✨</tg-emoji> Думаю...'
 
 logger = logging.getLogger(__name__)
 
