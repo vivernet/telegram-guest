@@ -54,6 +54,7 @@ class GuestQueryState:
     answered: bool = False
     inline_message_id: str | None = None
     placeholder_active: bool = False
+    created_mono: float = field(default_factory=time.monotonic)
     answer_lock: asyncio.Lock = field(default_factory=asyncio.Lock, repr=False)
 
 
@@ -75,10 +76,15 @@ class GuestTelegramAdapter(telegram_base.TelegramAdapter):
 
     def __init__(self, config):
         super().__init__(config)
+        # Гостевому режиму нужен нативный rich-финал (Bot API rich_message), иначе
+        # MarkdownV2-редактирование inline-сообщений сбоит и форматирование ломается.
+        # Если API/токен не поддерживает rich — есть гарантированный фолбэк на MDv2/plain.
+        self._rich_messages_enabled = True
         self._guest_queries: dict[str, GuestQueryState] = {}
         self._answer_attempted_query_ids: dict[str, float] = {}
         self._guest_session_last_query: dict[str, str] = {}
         self._guest_last_inline: dict[str, str] = {}
+        self._guest_busy: dict[str, bool] = {}
         self._guest_handler_apps: set[int] = set()
 
     def _remember_guest_query(self, session_chat_id: str, query_id: str) -> GuestQueryState:
@@ -150,6 +156,10 @@ class GuestTelegramAdapter(telegram_base.TelegramAdapter):
             return "/clean"
         if lower in ("/del", "/delete"):
             return "/del"
+        if lower in ("/status", "/статус", "/state"):
+            return "/status"
+        if lower in ("/help", "/помощь"):
+            return "/help"
         return None
 
     def _last_guest_inline_id(self, session_chat_id: str) -> str | None:
@@ -195,13 +205,84 @@ class GuestTelegramAdapter(telegram_base.TelegramAdapter):
                     "Отправь эту команду ответом на сообщение бота.",
                 )
                 return True
+            # Приоритет: очистить именно то сообщение, на которое ответил
+            # пользователь, а не последний пузырь сессии. Гостевые ответы —
+            # inline-сообщения, их можно редактировать и по chat_id + message_id.
+            chat = getattr(message, "chat", None)
+            real_chat_id = str(getattr(chat, "id", "") or "").strip()
+            replied_msg_id = getattr(replied, "message_id", None)
+            if real_chat_id and replied_msg_id is not None:
+                try:
+                    await self._bot._post(
+                        "editMessageText",
+                        {
+                            "chat_id": real_chat_id,
+                            "message_id": replied_msg_id,
+                            "text": "...",
+                        },
+                    )
+                    await self._publish_guest(session_chat_id, "🗑 Сообщение очищено.")
+                    return True
+                except Exception:
+                    logger.warning(
+                        "[Telegram Guest] /del edit failed for replied message",
+                        exc_info=True,
+                    )
+                    await self._publish_guest(
+                        session_chat_id, "Не удалось очистить сообщение.",
+                    )
+                    return True
             inline_id = self._last_guest_inline_id(session_chat_id)
             if not inline_id:
                 await self._publish_guest(session_chat_id, "Не нашёл сообщение для удаления.")
                 return True
             await self._replace_guest_reply_with_ellipsis(inline_id, session_chat_id)
             return True
+        if cmd == "/status":
+            await self._publish_guest(session_chat_id, self._guest_status_text(session_chat_id))
+            return True
+        if cmd == "/help":
+            await self._publish_guest(session_chat_id, self._guest_help_text())
+            return True
         return False
+
+    def _guest_status_text(self, session_chat_id: str) -> str:
+        """Краткая сводка состояния последнего запроса гостевой сессии."""
+        previous_query_id = self._guest_session_last_query.get(session_chat_id)
+        busy = self._guest_busy.get(session_chat_id, False)
+        lines = ["⚙️ Статус", ""]
+        if previous_query_id:
+            state = self._guest_queries.get(guest_chat_id(previous_query_id))
+            if state is not None:
+                elapsed = int(time.monotonic() - state.created_mono)
+                if busy:
+                    state_text = "идёт обработка…"
+                elif state.answered:
+                    state_text = "опубликовано"
+                else:
+                    state_text = "завершено, публикация не выполнялась"
+                lines.append(f"• Обработка: {state_text}")
+                lines.append(f"• Прошло: {elapsed} с")
+                lines.append(f"• Объём ответа: {len(state.latest_content)} симв.")
+                lines.append(f"• Финальная публикация: {'да' if state.delivered_finalized else 'нет'}")
+            else:
+                lines.append("• Активных запросов нет")
+        else:
+            lines.append("• Активных запросов нет")
+        lines.append("")
+        lines.append("Напиши вопрос или упомяни бота — отвечу.")
+        return "\n".join(lines)
+
+    def _guest_help_text(self) -> str:
+        """Список команд, доступных гостю."""
+        return (
+            "🤖 Команды гостевого режима:\n\n"
+            "• /help — этот список команд\n"
+            "• /status (/статус) — статус обработки последнего запроса\n"
+            "• /clean — сбросить историю текущей сессии\n"
+            "• /del — удалить сообщение бота (ответом на него)\n\n"
+            "Просто напиши вопрос — и я отвечу."
+        )
 
     def _ensure_guest_handler(self, app) -> bool:
         """Install the catch-all guest handler without risking normal Telegram."""
@@ -494,7 +575,11 @@ class GuestTelegramAdapter(telegram_base.TelegramAdapter):
 
         await self._enrich_guest_direct(message, event)
         await self._enrich_guest_reply(message, event)
-        await self.handle_message(event)
+        self._guest_busy[session_chat_id] = True
+        try:
+            await self.handle_message(event)
+        finally:
+            self._guest_busy[session_chat_id] = False
 
     async def _handle_guest_update_and_stop(self, update: Update, context) -> None:
         """Handle Guest updates exclusively so normal message handlers cannot double-process them."""
