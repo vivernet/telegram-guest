@@ -4,6 +4,7 @@ import asyncio
 import hashlib
 import inspect
 import logging
+import secrets
 import time
 from dataclasses import dataclass, field
 from typing import Any
@@ -53,6 +54,9 @@ class GuestQueryState:
     inline_message_id: str | None = None
     answered_wallclock: float | None = None
     placeholder_active: bool = False
+    approval_actor_id: int | None = None
+    approval_card_active: bool = False
+    approval_cancel_attempted: bool = False
     created_mono: float = field(default_factory=time.monotonic)
     answer_lock: asyncio.Lock = field(default_factory=asyncio.Lock, repr=False)
 
@@ -85,6 +89,9 @@ class GuestTelegramAdapter(telegram_base.TelegramAdapter):
         self._guest_session_queries: dict[str, list[str]] = {}
         self._guest_last_inline: dict[str, str] = {}
         self._guest_busy: dict[str, bool] = {}
+        self._guest_session_locks: dict[str, asyncio.Lock] = {}
+        self._guest_active_query: dict[str, str] = {}
+        self._guest_approval_bindings: dict[str, dict[str, Any]] = {}
         self._guest_handler_apps: set[int] = set()
 
     def _remember_guest_query(self, session_chat_id: str, query_id: str) -> GuestQueryState:
@@ -104,6 +111,16 @@ class GuestTelegramAdapter(telegram_base.TelegramAdapter):
                 break
             self._answer_attempted_query_ids.pop(retained_id, None)
         state_key = guest_chat_id(query_id)
+        state = self._guest_queries.get(state_key)
+        if state is not None:
+            return state
+        if len(self._guest_queries) >= self.MAX_RETAINED_QUERIES:
+            evictable = next((key for key, candidate in self._guest_queries.items()
+                              if not candidate.approval_card_active
+                              and not candidate.answer_lock.locked()), None)
+            if evictable is None:
+                raise RuntimeError("Guest query capacity exhausted")
+            self._guest_queries.pop(evictable)
         previous_query_id = self._guest_session_last_query.get(session_chat_id)
         if previous_query_id and previous_query_id != query_id:
             previous = self._guest_queries.get(guest_chat_id(previous_query_id))
@@ -115,15 +132,11 @@ class GuestTelegramAdapter(telegram_base.TelegramAdapter):
             ledger.append(query_id)
         if len(ledger) > self.MAX_RETAINED_QUERIES:
             del ledger[: len(ledger) - self.MAX_RETAINED_QUERIES]
-        state = self._guest_queries.get(state_key)
-        if state is None:
-            if len(self._guest_queries) >= self.MAX_RETAINED_QUERIES:
-                self._guest_queries.pop(next(iter(self._guest_queries)))
-            state = GuestQueryState(
-                query_id=query_id,
-                answer_attempted=query_id in self._answer_attempted_query_ids,
-            )
-            self._guest_queries[state_key] = state
+        state = GuestQueryState(
+            query_id=query_id,
+            answer_attempted=query_id in self._answer_attempted_query_ids,
+        )
+        self._guest_queries[state_key] = state
         return state
 
     def _guest_session_chat_id(self, message: Message, query_id: str) -> str:
@@ -178,13 +191,24 @@ class GuestTelegramAdapter(telegram_base.TelegramAdapter):
     async def _replace_guest_reply_with_ellipsis(
         self, inline_id: str, session_chat_id: str,
     ) -> None:
-        try:
-            await self._bot._post(
-                "editMessageText",
-                {"inline_message_id": inline_id, "text": "..."},
-            )
-        except Exception:
-            logger.warning("[Telegram Guest] /del inline edit failed", exc_info=True)
+        matches = [state for state in self._guest_queries.values()
+                   if state.inline_message_id == inline_id]
+        if len(matches) != 1:
+            return
+        state = matches[0]
+        failed = False
+        async with state.answer_lock:
+            if state.approval_card_active or state.inline_message_id != inline_id:
+                return
+            try:
+                await self._bot._post(
+                    "editMessageText",
+                    {"inline_message_id": inline_id, "text": "..."},
+                )
+            except Exception:
+                logger.warning("[Telegram Guest] /del inline edit failed", exc_info=True)
+                failed = True
+        if failed:
             await self._publish_guest(session_chat_id, "Не удалось очистить сообщение.")
 
     async def _dispatch_guest_command(
@@ -292,30 +316,7 @@ class GuestTelegramAdapter(telegram_base.TelegramAdapter):
                 await self._replace_guest_reply_with_ellipsis(inline_id, session_chat_id)
                 return True
 
-            # 4) Цель не является гостевым ответом — попытка по chat_id + message_id.
-            chat = getattr(message, "chat", None)
-            real_chat_id = str(getattr(chat, "id", "") or "").strip()
-            replied_msg_id = getattr(replied, "message_id", None)
-            if real_chat_id and replied_msg_id is not None:
-                try:
-                    await self._bot._post(
-                        "editMessageText",
-                        {
-                            "chat_id": real_chat_id,
-                            "message_id": replied_msg_id,
-                            "text": "...",
-                        },
-                    )
-                    return True
-                except Exception:
-                    logger.warning(
-                        "[Telegram Guest] /del edit failed for replied message",
-                        exc_info=True,
-                    )
-                    await self._publish_guest(
-                        session_chat_id, "Не удалось очистить сообщение.",
-                    )
-                    return True
+            # Unknown chat/message identities cannot be checked against a card.
             await self._publish_guest(session_chat_id, "Не нашёл сообщение для удаления.")
             return True
         if cmd == "/status":
@@ -337,8 +338,14 @@ class GuestTelegramAdapter(telegram_base.TelegramAdapter):
                 elapsed = int(time.monotonic() - state.created_mono)
                 if busy:
                     state_text = "идёт обработка…"
+                elif state.delivered_finalized:
+                    state_text = "завершено, финальный ответ опубликован"
+                elif state.answer_error:
+                    state_text = f"Telegram не подтвердил публикацию: {state.answer_error}"
+                elif state.delivered_content:
+                    state_text = "завершено, опубликован только промежуточный ответ"
                 elif state.answered:
-                    state_text = "опубликовано"
+                    state_text = "запрос принят; финальная публикация не подтверждена"
                 else:
                     state_text = "завершено, публикация не выполнялась"
                 lines.append(f"• Обработка: {state_text}")
@@ -611,13 +618,26 @@ class GuestTelegramAdapter(telegram_base.TelegramAdapter):
             return
 
         session_chat_id = self._guest_session_chat_id(message, query_id)
-        state = self._remember_guest_query(session_chat_id, query_id)
+        if self._answer_attempted_query_ids.get(query_id, 0) > time.monotonic():
+            return
+        try:
+            state = self._remember_guest_query(session_chat_id, query_id)
+        except RuntimeError:
+            logger.warning("[Telegram Guest] Query capacity exhausted; rejecting update")
+            return
         if state.answer_attempted:
             logger.info(
                 "[Telegram Guest] Ignoring duplicate query=%s",
                 hashlib.sha256(query_id.encode("utf-8")).hexdigest()[:8],
             )
             return
+
+        user = getattr(message, "from_user", None)
+        user_id = getattr(user, "id", None)
+        if (getattr(message, "sender_chat", None) is None
+                and getattr(user, "is_bot", None) is False
+                and type(user_id) is int and user_id > 0):
+            state.approval_actor_id = user_id
 
         event = self._build_message_event(
             message,
@@ -642,24 +662,36 @@ class GuestTelegramAdapter(telegram_base.TelegramAdapter):
             if handled:
                 return
 
-        state.placeholder_active = True
-        thinking = await self._publish_guest(session_chat_id, GUEST_THINKING_TEXT)
-        if not thinking.success:
-            state.placeholder_active = False
-            logger.warning(
-                "[Telegram Guest] Could not publish initial thinking response query=%s: %s",
-                hashlib.sha256(query_id.encode("utf-8")).hexdigest()[:8],
-                thinking.error or "unknown error",
-            )
-            return
+        locks = getattr(self, "_guest_session_locks", None)
+        if locks is None:
+            locks = self._guest_session_locks = {}
+        session_lock = locks.setdefault(session_chat_id, asyncio.Lock())
+        async with session_lock:
+            active_queries = getattr(self, "_guest_active_query", None)
+            if active_queries is None:
+                active_queries = self._guest_active_query = {}
+            active_queries[session_chat_id] = query_id
+            state.placeholder_active = True
+            thinking = await self._publish_guest(session_chat_id, GUEST_THINKING_TEXT)
+            if not thinking.success:
+                state.placeholder_active = False
+                active_queries.pop(session_chat_id, None)
+                logger.warning(
+                    "[Telegram Guest] Could not publish initial thinking response query=%s: %s",
+                    hashlib.sha256(query_id.encode("utf-8")).hexdigest()[:8],
+                    thinking.error or "unknown error",
+                )
+                return
 
-        await self._enrich_guest_direct(message, event)
-        await self._enrich_guest_reply(message, event)
-        self._guest_busy[session_chat_id] = True
-        try:
-            await self.handle_message(event)
-        finally:
-            self._guest_busy[session_chat_id] = False
+            await self._enrich_guest_direct(message, event)
+            await self._enrich_guest_reply(message, event)
+            self._guest_busy[session_chat_id] = True
+            try:
+                await self.handle_message(event)
+            finally:
+                self._guest_busy[session_chat_id] = False
+                if active_queries.get(session_chat_id) == query_id:
+                    active_queries.pop(session_chat_id, None)
 
     async def _handle_guest_update_and_stop(self, update: Update, context) -> None:
         """Handle Guest updates exclusively so normal message handlers cannot double-process them."""
@@ -714,6 +746,239 @@ class GuestTelegramAdapter(telegram_base.TelegramAdapter):
         )
         return True
 
+    async def _deliver_guest_approval_card(
+        self, *, query_id: str, inline_message_id: str, actor_id: int,
+        preview: str, approve_token: str, deny_token: str,
+    ) -> bool:
+        """Unwired transport only: no callback authentication or approval grant.
+
+        Caller must supply a safe preview and opaque tokens. A failed or
+        cancelled edit leaves the bubble locked because delivery is ambiguous.
+        """
+        if not isinstance(query_id, str) or not query_id:
+            return False
+        state = self._guest_queries.get(guest_chat_id(query_id))
+        if state is None or state.query_id != query_id:
+            return False
+        if (type(actor_id) is not int or actor_id != state.approval_actor_id
+                or not isinstance(inline_message_id, str) or not inline_message_id
+                or not isinstance(preview, str) or not preview.strip()
+                or telegram_base.utf16_len(preview) > self.MAX_MESSAGE_LENGTH
+                or not all(isinstance(t, str) and 1 <= len(t.encode('utf-8')) <= 64
+                           for t in (approve_token, deny_token))
+                or approve_token == deny_token):
+            return False
+        async with state.answer_lock:
+            if (not self._bot or not state.answered or state.rich_edit_ambiguous
+                    or state.inline_message_id != inline_message_id
+                    or state.approval_card_active):
+                return False
+            state.approval_card_active = True
+            try:
+                result = await self._bot._post("editMessageText", {
+                    "inline_message_id": inline_message_id,
+                    "text": preview,
+                    "reply_markup": {"inline_keyboard": [[
+                        {"text": "Подтвердить", "callback_data": approve_token},
+                        {"text": "Отклонить", "callback_data": deny_token},
+                    ]]},
+                })
+                return result is not None and result is not False
+            except Exception:
+                return False
+
+    async def _send_exec_approval_prompt(self, prompt) -> SendResult:
+        """Route guest approvals into the exact active guest reply; fail closed otherwise."""
+        session_chat_id = str(getattr(prompt, "chat_id", "") or "")
+        if not is_guest_chat_id(session_chat_id):
+            return await super()._send_exec_approval_prompt(prompt)
+        query_id = getattr(self, "_guest_active_query", {}).get(session_chat_id)
+        state = self._guest_queries.get(guest_chat_id(query_id)) if query_id else None
+        actor_id = getattr(state, "approval_actor_id", None)
+        inline_id = getattr(state, "inline_message_id", None)
+        if (state is None or not state.answered or not actor_id or not inline_id
+                or state.rich_edit_ambiguous):
+            return SendResult(success=False, error="Guest approval target is unavailable")
+
+        from tools.approval import list_gateway_approvals, register_gateway_settle
+        pending = list_gateway_approvals(prompt.session_key)
+        matches = [entry for entry in pending
+                   if entry.get("command") == prompt.command
+                   and entry.get("description") == prompt.description
+                   and "mcp_elicitation" in entry.get("pattern_keys", [])]
+        if len(matches) != 1 or not matches[0].get("request_id"):
+            return SendResult(success=False, error="Could not uniquely bind the guest approval request")
+
+        approval_id = secrets.token_urlsafe(12)
+        approve_token = f"ga:ok:{approval_id}"
+        deny_token = f"ga:no:{approval_id}"
+        bindings = getattr(self, "_guest_approval_bindings", None)
+        if bindings is None:
+            bindings = self._guest_approval_bindings = {}
+        bindings[approval_id] = {
+            "query_id": query_id,
+            "inline_message_id": inline_id,
+            "actor_id": actor_id,
+            "session_key": prompt.session_key,
+            "request_id": matches[0]["request_id"],
+            "state": state,
+        }
+        reason = str(getattr(prompt, "description", "") or "Требуется подтвердить действие.")
+        preview = f"⚠️ Подтверждение действия\n\n{reason}"
+        if telegram_base.utf16_len(preview) > self.MAX_MESSAGE_LENGTH:
+            preview = preview[: self.MAX_MESSAGE_LENGTH - 1] + "…"
+        delivered = await self._deliver_guest_approval_card(
+            query_id=query_id,
+            inline_message_id=inline_id,
+            actor_id=actor_id,
+            preview=preview,
+            approve_token=approve_token,
+            deny_token=deny_token,
+        )
+        if not delivered:
+            bindings.pop(approval_id, None)
+            return SendResult(success=False, error="Guest approval card could not be delivered")
+        loop = asyncio.get_running_loop()
+
+        def _settle(reason: str) -> None:
+            if loop.is_closed():
+                logger.warning("[Telegram Guest] Approval card settlement loop is unavailable")
+                return
+            coroutine = self._settle_guest_approval_card(approval_id, reason)
+            try:
+                asyncio.run_coroutine_threadsafe(coroutine, loop)
+            except RuntimeError:
+                coroutine.close()
+                logger.warning("[Telegram Guest] Approval card settlement loop is unavailable")
+
+        if not register_gateway_settle(prompt.session_key, matches[0]["request_id"], _settle):
+            # The decision may have raced card publication. Retire any still-live
+            # card instead of leaving a button for an approval no longer pending.
+            await self._settle_guest_approval_card(approval_id, "already_resolved")
+        return SendResult(success=True, message_id=str(inline_id))
+
+    async def _settle_guest_approval_card(self, approval_id: str, reason: str) -> None:
+        """Retire a card when its gateway request times out, closes, or resolves elsewhere."""
+        bindings = getattr(self, "_guest_approval_bindings", {})
+        binding = bindings.pop(approval_id, None)
+        if binding is None:
+            return
+        state = binding["state"]
+        if reason == "resolved":
+            text = "Подтверждение обработано в другом интерфейсе; кнопки больше не действуют."
+        else:
+            text = "Подтверждение истекло или сессия завершена; действие не выполнено."
+        retired = False
+        try:
+            async with state.answer_lock:
+                if (self._bot and state.approval_card_active
+                        and state.inline_message_id == binding["inline_message_id"]):
+                    await self._bot._post("editMessageText", {
+                        "inline_message_id": binding["inline_message_id"],
+                        "text": text,
+                        "reply_markup": {"inline_keyboard": []},
+                    })
+                    retired = True
+        except Exception:
+            logger.warning("[Telegram Guest] Could not retire settled approval card", exc_info=True)
+        if retired:
+            state.approval_card_active = False
+
+    async def _handle_guest_approval_callback(self, query, data: str) -> None:
+        """Resolve only a live one-shot decision bound to the original guest actor and bubble."""
+        parts = data.split(":", 2)
+        if len(parts) != 3 or parts[1] not in {"ok", "no"}:
+            await query.answer(text="Некорректное подтверждение.")
+            return
+        binding = getattr(self, "_guest_approval_bindings", {}).get(parts[2])
+        if binding is None:
+            await query.answer(text="Подтверждение уже истекло.")
+            return
+        user = getattr(query, "from_user", None)
+        user_id = getattr(user, "id", None)
+        inline_id = getattr(query, "inline_message_id", None)
+        if (type(user_id) is not int or user_id != binding["actor_id"]
+                or getattr(user, "is_bot", True) is not False
+                or inline_id != binding["inline_message_id"]):
+            await query.answer(text="Это подтверждение предназначено другому пользователю.")
+            return
+
+        # Claim before awaiting anything: duplicate taps cannot resolve the same gate twice.
+        self._guest_approval_bindings.pop(parts[2], None)
+        choice = "once" if parts[1] == "ok" else "deny"
+        try:
+            from tools.approval import resolve_gateway_approval
+            count = resolve_gateway_approval(
+                binding["session_key"], choice, request_id=binding["request_id"])
+        except Exception:
+            logger.error("[Telegram Guest] Approval callback resolution failed", exc_info=True)
+            count = 0
+
+        state = binding["state"]
+        message = "Решение принято. Выполняю действие…" if choice == "once" else "Действие отклонено."
+        if count:
+            try:
+                async with state.answer_lock:
+                    await self._bot._post("editMessageText", {
+                        "inline_message_id": inline_id,
+                        "text": message,
+                        "reply_markup": {"inline_keyboard": []},
+                    })
+            except Exception:
+                logger.warning("[Telegram Guest] Could not retire approval card", exc_info=True)
+            finally:
+                state.approval_card_active = False
+            await query.answer(text="Подтверждено." if choice == "once" else "Отклонено.")
+        else:
+            try:
+                async with state.answer_lock:
+                    await self._bot._post("editMessageText", {
+                        "inline_message_id": inline_id,
+                        "text": "Подтверждение истекло; действие не выполнено.",
+                        "reply_markup": {"inline_keyboard": []},
+                    })
+            except Exception:
+                logger.warning("[Telegram Guest] Could not retire expired approval card", exc_info=True)
+            finally:
+                state.approval_card_active = False
+            await query.answer(text="Подтверждение истекло.")
+
+    async def _handle_callback_query(self, update, context) -> None:
+        """Intercept guest approval callbacks; preserve all bundled Telegram callbacks."""
+        query = getattr(update, "callback_query", None)
+        data = getattr(query, "data", "") if query else ""
+        if isinstance(data, str) and data.startswith("ga:"):
+            await self._handle_guest_approval_callback(query, data)
+            return
+        await super()._handle_callback_query(update, context)
+
+    async def _cancel_guest_approval_card(
+        self, *, query_id: str, inline_message_id: str,
+    ) -> bool:
+        """Remove displayed buttons only; caller must revoke tokens separately.
+
+        This is not authorization or a broker decision. Keep the bubble pinned
+        and closed to output even when the transport result is ambiguous.
+        """
+        state = self._guest_queries.get(guest_chat_id(query_id))
+        if state is None or state.query_id != query_id:
+            return False
+        async with state.answer_lock:
+            if (not self._bot or not state.approval_card_active
+                    or state.inline_message_id != inline_message_id
+                    or state.approval_cancel_attempted):
+                return False
+            state.approval_cancel_attempted = True
+            try:
+                result = await self._bot._post("editMessageText", {
+                    "inline_message_id": inline_message_id,
+                    "text": "Кнопки скрыты; решение не принято.",
+                    "reply_markup": {"inline_keyboard": []},
+                })
+                return result is True
+            except Exception:
+                return False
+
     async def _publish_guest(
         self,
         chat_id: str,
@@ -734,6 +999,8 @@ class GuestTelegramAdapter(telegram_base.TelegramAdapter):
             return SendResult(success=False, error="Unknown guest query")
         query_ref = hashlib.sha256(state.query_id.encode("utf-8")).hexdigest()[:8]
         async with state.answer_lock:
+            if state.approval_card_active:
+                return SendResult(success=False, error="Guest approval card active", retryable=False)
             if state.answered and not allow_after_answer and not state.placeholder_active:
                 logger.info(
                     "[Telegram Guest] Suppressed unmarked send after answer query=%s",
@@ -1037,6 +1304,8 @@ class GuestTelegramAdapter(telegram_base.TelegramAdapter):
         state = self._guest_queries.get(str(chat_id))
         if state is None:
             return SendResult(success=False, error="Unknown guest query")
+        if state.answered and state.inline_message_id and message_id != state.inline_message_id:
+            return SendResult(success=False, error="Guest message identity mismatch", retryable=False)
         return await self._publish_guest(
             str(chat_id),
             content,

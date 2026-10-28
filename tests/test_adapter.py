@@ -45,9 +45,222 @@ def adapter():
     instance._guest_session_queries = {}
     instance._guest_last_inline = {}
     instance._guest_busy = {}
+    instance._guest_session_locks = {}
+    instance._guest_active_query = {}
+    instance._guest_approval_bindings = {}
     instance._status_message_ids = {}
     instance.config = SimpleNamespace(extra={}, home_channel=None)
     return instance
+
+
+@pytest.mark.asyncio
+async def test_guest_exec_approval_edits_active_bubble_with_two_bound_buttons(adapter):
+    state = adapter._remember_guest_query("guest:999:42", "q")
+    state.answered = True
+    state.inline_message_id = "inline-q"
+    state.approval_actor_id = 42
+    adapter._guest_active_query["guest:999:42"] = "q"
+    adapter._bot._post.return_value = {"message_id": 7}
+    prompt = SimpleNamespace(
+        chat_id="guest:999:42", session_key="session-key",
+        command="MCP tool 'telegram_delete_message' on UNTRUSTED server 'telegram' wants to run.",
+        description="Delete selected Telegram messages.", text="do not expose full arguments",
+    )
+
+    settle_callbacks = []
+    with (
+        patch("tools.approval.list_gateway_approvals", return_value=[{
+            "command": prompt.command, "description": prompt.description,
+            "pattern_keys": ["mcp_elicitation"], "request_id": "approval-request",
+        }]),
+        patch("tools.approval.register_gateway_settle",
+              side_effect=lambda session, request, callback: settle_callbacks.append(
+                  (session, request, callback)) or True) as register_settle,
+    ):
+        result = await adapter._send_exec_approval_prompt(prompt)
+
+    assert result.success
+    method, payload = adapter._bot._post.await_args.args
+    assert method == "editMessageText"
+    assert payload["inline_message_id"] == "inline-q"
+    assert payload["text"] == "⚠️ Подтверждение действия\n\nDelete selected Telegram messages."
+    buttons = payload["reply_markup"]["inline_keyboard"][0]
+    assert [button["text"] for button in buttons] == ["Подтвердить", "Отклонить"]
+    assert all(len(button["callback_data"].encode("utf-8")) <= 64 for button in buttons)
+    assert len(adapter._guest_approval_bindings) == 1
+    register_settle.assert_called_once_with("session-key", "approval-request", settle_callbacks[0][2])
+    retired = asyncio.Event()
+
+    async def post(method, payload):
+        if payload.get("text", "").startswith("Подтверждение истекло"):
+            retired.set()
+        return {"inline_message_id": "inline-q"}
+
+    adapter._bot._post.side_effect = post
+    settle_callbacks[0][2]("timeout")
+    await asyncio.wait_for(retired.wait(), timeout=1)
+    assert not adapter._guest_approval_bindings
+    assert not state.approval_card_active
+    assert adapter._bot._post.await_args.args[1]["text"].startswith("Подтверждение истекло")
+
+
+@pytest.mark.asyncio
+async def test_guest_approval_callback_requires_exact_user_and_inline_message(adapter, monkeypatch):
+    from tools import approval
+    from tools.approval_gateway_wait import _ApprovalEntry
+
+    state = adapter._remember_guest_query("guest:999:42", "q")
+    state.approval_card_active = True
+    target = _ApprovalEntry({"request_id": "request-1"})
+    other = _ApprovalEntry({"request_id": "request-2"})
+    monkeypatch.setattr(approval, "_gateway_queues", {"session-key": [target, other]})
+    adapter._guest_approval_bindings["nonce"] = {
+        "query_id": "q", "inline_message_id": "inline-q", "actor_id": 42,
+        "session_key": "session-key", "request_id": "request-1", "state": state,
+    }
+    query = SimpleNamespace(
+        data="ga:ok:nonce", inline_message_id="wrong",
+        from_user=SimpleNamespace(id=42, is_bot=False), answer=AsyncMock(),
+    )
+    await adapter._handle_guest_approval_callback(query, query.data)
+    assert target.result is None
+    assert other.result is None
+    assert approval.list_gateway_approvals("session-key") == [target.data, other.data]
+    assert "nonce" in adapter._guest_approval_bindings
+    query.inline_message_id = "inline-q"
+    await adapter._handle_guest_approval_callback(query, query.data)
+    assert target.result == "once"
+    assert other.result is None
+    assert approval.list_gateway_approvals("session-key") == [other.data]
+    await adapter._handle_guest_approval_callback(query, query.data)
+    assert "nonce" not in adapter._guest_approval_bindings
+    assert not state.approval_card_active
+
+
+@pytest.mark.asyncio
+async def test_guest_approval_callback_denies_and_is_one_shot(adapter, monkeypatch):
+    from tools import approval
+    from tools.approval_gateway_wait import _ApprovalEntry
+
+    state = adapter._remember_guest_query("guest:999:42", "q")
+    state.approval_card_active = True
+    target = _ApprovalEntry({"request_id": "request-1"})
+    monkeypatch.setattr(approval, "_gateway_queues", {"session-key": [target]})
+    adapter._guest_approval_bindings["nonce"] = {
+        "query_id": "q", "inline_message_id": "inline-q", "actor_id": 42,
+        "session_key": "session-key", "request_id": "request-1", "state": state,
+    }
+    query = SimpleNamespace(
+        inline_message_id="inline-q", from_user=SimpleNamespace(id=42, is_bot=False),
+        answer=AsyncMock(),
+    )
+    await adapter._handle_guest_approval_callback(query, "ga:no:nonce")
+    assert target.result == "deny"
+    assert not approval.list_gateway_approvals("session-key")
+
+
+@pytest.mark.asyncio
+async def test_delete_waits_for_inflight_approval_and_cannot_erase_it(adapter):
+    state = adapter._remember_guest_query("guest:session", "q")
+    state.answered = True
+    state.inline_message_id = "inline-q"
+    state.approval_actor_id = 42
+    started, release = asyncio.Event(), asyncio.Event()
+
+    async def post(method, payload):
+        started.set()
+        await release.wait()
+        return True
+
+    adapter._bot._post.side_effect = post
+    card = asyncio.create_task(adapter._deliver_guest_approval_card(
+        query_id="q", inline_message_id="inline-q", actor_id=42,
+        preview="preview", approve_token="a", deny_token="b"))
+    await started.wait()
+    deletion = asyncio.create_task(adapter._replace_guest_reply_with_ellipsis("inline-q", "guest:session"))
+    await asyncio.sleep(0)
+    release.set()
+    await asyncio.gather(card, deletion)
+    assert adapter._bot._post.await_count == 1
+
+
+@pytest.mark.asyncio
+async def test_active_card_is_not_evicted_and_duplicate_does_not_retarget_session(adapter):
+    adapter.MAX_RETAINED_QUERIES = 2
+    old = adapter._remember_guest_query("guest:session", "old")
+    old.approval_card_active = True
+    old.answered = True
+    old.inline_message_id = "protected"
+    adapter._remember_guest_query("guest:session", "new")
+    adapter._remember_guest_query("guest:session", "old")
+    assert adapter._guest_session_last_query["guest:session"] == "new"
+    adapter._remember_guest_query("guest:other", "third")
+    assert adapter._guest_queries["guest:old"] is old
+    assert not (await adapter.send("guest:old", "final", metadata={"notify": True})).success
+    adapter._bot._post.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_edit_rejects_mismatched_inline_identity(adapter):
+    state = adapter._remember_guest_query("guest:session", "q")
+    state.answered = True
+    state.inline_message_id = "inline-q"
+    result = await adapter.edit_message("guest:q", "different-inline", "wrong", finalize=True)
+    assert not result.success
+    adapter._bot._post.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_cancel_card_removes_buttons_but_never_unlocks_output(adapter):
+    state = adapter._remember_guest_query("guest:session", "q")
+    state.answered = True
+    state.inline_message_id = "inline-q"
+    state.approval_card_active = True
+    adapter._bot._post.return_value = True
+    assert not await adapter._cancel_guest_approval_card(query_id="q", inline_message_id="other")
+    assert await adapter._cancel_guest_approval_card(query_id="q", inline_message_id="inline-q")
+    assert adapter._bot._post.await_args.args[1] == {
+        "inline_message_id": "inline-q", "text": "Кнопки скрыты; решение не принято.",
+        "reply_markup": {"inline_keyboard": []},
+    }
+    assert not (await adapter.send("guest:q", "final", metadata={"notify": True})).success
+
+
+@pytest.mark.asyncio
+async def test_cancel_card_failure_keeps_card_locked(adapter):
+    state = adapter._remember_guest_query("guest:session", "q")
+    state.answered = True
+    state.inline_message_id = "inline-q"
+    state.approval_card_active = True
+    adapter._bot._post.side_effect = RuntimeError("ambiguous")
+    assert not await adapter._cancel_guest_approval_card(query_id="q", inline_message_id="inline-q")
+    assert state.approval_card_active
+    assert not (await adapter.send("guest:q", "final", metadata={"notify": True})).success
+
+
+@pytest.mark.asyncio
+async def test_delete_never_uses_unmapped_chat_message_target(adapter):
+    adapter._remember_guest_query("guest:session", "command")
+    message = SimpleNamespace(reply_to_message=SimpleNamespace(
+        text="unmapped", message_id=5, chat=SimpleNamespace(id=999),
+        guest_query_id=None, api_kwargs={}, date=None), chat=SimpleNamespace(id=999))
+    await adapter._dispatch_guest_command("/del", message, "guest:session", None)
+    assert not any(call.args[0] == "editMessageText" for call in adapter._bot._post.await_args_list)
+
+
+@pytest.mark.asyncio
+async def test_evicted_duplicate_update_does_not_retarget_session(adapter):
+    adapter.config.extra = {"allow_from": ["42"]}
+    adapter.MAX_RETAINED_QUERIES = 1
+    adapter._build_message_event = lambda message, message_type, update_id=None: SimpleNamespace(
+        source=SimpleNamespace(chat_id="999", chat_type="group", user_id="42", thread_id=None),
+        raw_message=message, text=message.text)
+    adapter.handle_message = AsyncMock()
+    await adapter._handle_guest_update(_guest_update(1, 999, 42, "hello", "old"), None)
+    await adapter._handle_guest_update(_guest_update(2, 999, 42, "hello", "new"), None)
+    await adapter._handle_guest_update(_guest_update(3, 999, 42, "hello", "old"), None)
+    assert adapter._guest_session_last_query["guest:999:42"] == "new"
+    assert "guest:new" in adapter._guest_queries
 
 
 def test_guest_chat_ids_are_namespaced_and_round_trip():
@@ -56,6 +269,30 @@ def test_guest_chat_ids_are_namespaced_and_round_trip():
     assert chat_id == "guest:query-123"
     assert is_guest_chat_id(chat_id)
     assert not is_guest_chat_id("16715013")
+
+
+def test_guest_status_distinguishes_final_delivery_from_accepted_placeholder(adapter):
+    state = adapter._remember_guest_query("guest:session", "q")
+    state.answered = True
+    state.latest_content = "Answer"
+
+    status = adapter._guest_status_text("guest:session")
+
+    assert "запрос принят; финальная публикация не подтверждена" in status
+    assert "Финальная публикация: нет" in status
+    state.delivered_finalized = True
+    assert "завершено, финальный ответ опубликован" in adapter._guest_status_text("guest:session")
+
+
+def test_guest_status_reports_send_error_without_claiming_completion(adapter):
+    state = adapter._remember_guest_query("guest:session", "q")
+    state.answer_error = "Telegram timeout"
+
+    status = adapter._guest_status_text("guest:session")
+
+    assert "Telegram не подтвердил публикацию" in status
+    assert "Telegram timeout" in status
+    assert "опубликовано" not in status
 
 
 @pytest.mark.asyncio
@@ -69,6 +306,69 @@ async def test_guest_preview_answers_query_and_remembers_inline_message(adapter)
     assert result.message_id == "guest-inline-1"
     assert adapter._guest_queries[chat_id].latest_content == "partial"
     assert adapter._guest_queries[chat_id].inline_message_id == "guest-inline-1"
+
+
+@pytest.mark.asyncio
+async def test_approval_card_edits_exact_bubble_and_blocks_stream(adapter):
+    adapter.config.extra = {"allow_from": ["42"]}
+    adapter._build_message_event = lambda message, message_type, update_id=None: SimpleNamespace(
+        source=SimpleNamespace(chat_id="999", chat_type="group", user_id="42", thread_id=None),
+        raw_message=message, text=message.text,
+    )
+    adapter.handle_message = AsyncMock()
+    await adapter._handle_guest_update(_guest_update(77, 999, 42, "hello", "q1"), None)
+    adapter._remember_guest_query("guest:999:42", "q2")
+    adapter._bot._post.return_value = True
+    result = await adapter._deliver_guest_approval_card(
+        query_id="q1", inline_message_id="guest-inline-1", actor_id=42,
+        preview="Safe preview", approve_token="opaque-approve", deny_token="opaque-deny",
+    )
+    assert result is True
+    method, payload = adapter._bot._post.await_args.args
+    assert method == "editMessageText"
+    assert payload["inline_message_id"] == "guest-inline-1"
+    assert payload["text"] == "Safe preview"
+    assert [button["callback_data"] for row in payload["reply_markup"]["inline_keyboard"] for button in row] == ["opaque-approve", "opaque-deny"]
+    before = adapter._bot._post.await_count
+    stream = await adapter.edit_message("guest:q1", "guest-inline-1", "stream", finalize=True)
+    assert not stream.success
+    assert adapter._bot._post.await_count == before
+
+
+@pytest.mark.asyncio
+async def test_approval_card_rejects_wrong_binding_without_edit(adapter):
+    adapter._remember_guest_query("guest:session", "q")
+    await adapter.send("guest:q", "thinking", metadata={"expect_edits": True})
+    before = adapter._bot._post.await_count
+    result = await adapter._deliver_guest_approval_card(
+        query_id="q", inline_message_id="guest-inline-1", actor_id=42,
+        preview="Safe preview", approve_token="a", deny_token="b",
+    )
+    assert result is False
+    assert adapter._bot._post.await_count == before
+
+
+@pytest.mark.asyncio
+async def test_approval_card_binding_and_ambiguous_edit_fail_closed(adapter):
+    adapter.config.extra = {"allow_from": ["42"]}
+    adapter._build_message_event = lambda message, message_type, update_id=None: SimpleNamespace(
+        source=SimpleNamespace(chat_id="999", chat_type="group", user_id="42", thread_id=None),
+        raw_message=message, text=message.text,
+    )
+    adapter.handle_message = AsyncMock()
+    await adapter._handle_guest_update(_guest_update(78, 999, 42, "hello", "q"), None)
+    args = dict(query_id="q", inline_message_id="guest-inline-1", actor_id=42,
+                preview="Safe preview", approve_token="token-a", deny_token="token-b")
+    before = adapter._bot._post.await_count
+    for wrong in (dict(actor_id=43), dict(inline_message_id="other"),
+                  dict(query_id="missing"), dict(deny_token="token-a")):
+        assert not await adapter._deliver_guest_approval_card(**(args | wrong))
+    assert adapter._bot._post.await_count == before
+    adapter._bot._post.side_effect = RuntimeError("ambiguous")
+    assert not await adapter._deliver_guest_approval_card(**args)
+    assert not await adapter._deliver_guest_approval_card(**args)
+    assert not (await adapter.send("guest:q", "final", metadata={"notify": True})).success
+    assert adapter._bot._post.await_count == before + 1
 
 
 @pytest.mark.asyncio
