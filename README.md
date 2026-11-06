@@ -4,25 +4,26 @@ Native [Telegram Guest Bot](https://core.telegram.org/bots/features#guest-bots) 
 
 Guest Mode lets someone mention your bot in a Telegram chat where the bot is **not a member**. Telegram sends the bot limited context and allows one response. This plugin adds that update and response path while delegating ordinary Telegram traffic to Hermes' bundled adapter.
 
-> **Compatibility:** requires Hermes `v0.20.6` or newer with `ctx.register_platform_handler`, and is verified with `python-telegram-bot 22.8`. The plugin still uses selected private Telegram delivery/enrichment helpers, so a future Hermes update may require a compatibility fix.
+> **Compatibility:** requires Hermes `v0.23.0` or newer for the native Telegram environment-to-config bridge, and is verified with `python-telegram-bot 22.8`. The plugin still uses selected private Telegram delivery/enrichment helpers, so a future Hermes update may require a compatibility fix.
 
 ## Install with Hermes
 
 Send your Hermes agent this repository URL with the following request:
 
-> Install the plugin from https://github.com/roziscoding/hermes-telegram-guest-mode. Inspect the repository first, then follow its README. Do not overwrite an unrelated existing plugin directory. After enabling it, restart the gateway, verify Telegram reconnects, and roll back by disabling the plugin if startup fails.
+> Install the plugin from https://github.com/vivernet/telegram-guest. Inspect the repository first and verify its source/pin. Do not overwrite an unrelated existing plugin directory. After installation, ask me to restart the gateway; do not restart it on my behalf.
 
-Hermes should inspect the repository, install it through the native plugin manager, restart the gateway, and verify connectivity.
+Hermes should inspect the repository and install it through the native plugin manager. A running gateway loads the updated plugin only after it is restarted; the user performs that restart and verifies connectivity.
 
 ## Manual installation
 
 ```bash
-hermes plugins install https://github.com/roziscoding/hermes-telegram-guest-mode --enable
-hermes gateway restart
+hermes plugins install vivernet/telegram-guest --enable
 hermes gateway status
 ```
 
 Hermes reads `name: telegram-guest` from the manifest and installs the repository under that canonical plugin name. The plugin does not need permission to override built-in tools.
+
+For reproducible profile restores, use the full commit SHA recorded in that profile's manifest instead of installing a moving branch. The installed Git source must remain `vivernet/telegram-guest`.
 
 If `telegram-guest` is already installed, inspect the existing plugin and its Git origin instead of using `--force` blindly.
 
@@ -41,8 +42,9 @@ host chat ID:
 
 ```bash
 hermes config set --force platforms.telegram.extra.guest_group_allow_from '["-1001234567890"]'
-hermes gateway restart
 ```
+
+Restart the gateway yourself after changing this setting.
 
 `guest_group_allow_from` accepts a list of Telegram group IDs, or `"*"` to trust
 every group. It never bypasses user authorization in private chats. A Guest
@@ -59,16 +61,18 @@ key authorizes a channel profile used as the sender (`sender_chat`), while
 Guest conversations are one-shot from Telegram's point of view: each mention is
 a separate `guest_query_id` with a single allowed reply. By default the plugin
 still gives a guest a *stable conversation history* by keying the Hermes session
-on the real chat + caller (and thread when present) instead of the one-shot
-query id. That means a guest who mentions the bot again in the same chat keeps
-the previous context, exactly like a normal private chat would.
+on the real chat + caller and, when present, the exact `message_thread_id`
+instead of the one-shot query id. Unthreaded messages preserve the existing
+chat+caller key; each forum/DM topic gets its own persistent history and guest
+state, separate from other topics in the same host chat.
 
 To opt out (behavior strictly per-query, no memory between mentions):
 
 ```bash
 hermes config set --force platforms.telegram.extra.persistent_guest_sessions 'false'
-hermes gateway restart
 ```
+
+Restart the gateway yourself after changing this setting.
 
 The one-shot delivery is unchanged either way: each mention still gets its own
 `answerGuestQuery` reply. Persistent sessions accumulate records in the session
@@ -92,8 +96,11 @@ replies to the bot's message). The plugin understands:
 
 ```bash
 hermes plugins update telegram-guest
-hermes gateway restart
 ```
+
+The update follows the source saved in installer metadata. Verify it still
+points to `vivernet/telegram-guest` before updating. Restart the gateway
+yourself to load the new code.
 
 ## How it works
 
@@ -113,6 +120,7 @@ The plugin uses Hermes' native `ctx.register_platform_handler("telegram", ...)` 
 - bridges `is_turn_final` through older Hermes StreamConsumer edit paths so rich promotion happens only for the completed turn, never for tool/segment, split, or cancellation boundaries;
 - falls back from a permanently rejected rich final to MarkdownV2, and from rejected MarkdownV2 to plain text, without duplicating ambiguous edits;
 - suppresses internal lifecycle/status bubbles and prevents auxiliary footer sends from replacing a completed Guest response;
+- scopes persistent history, per-session locks, commands, and query ledgers by chat + caller + thread when present, while binding each active stream/approval to its exact `guest_query_id`;
 - retains the complete pending replacement after an edit failure so Hermes can retry without replacing the response with a continuation-only tail;
 - delegates normal sends, edits, typing indicators, and ordinary updates to the bundled adapter;
 - authorizes the Guest caller through Hermes' user-level Telegram policy, including adapter allowlists, environment allowlists, pairing, and global policy.
@@ -148,8 +156,9 @@ If normal Telegram connectivity fails, disable the plugin and restart:
 
 ```bash
 hermes plugins disable telegram-guest
-hermes gateway restart
 ```
+
+Restart the gateway yourself to apply the change.
 
 If guest mentions are ignored but normal Telegram works:
 
@@ -163,11 +172,13 @@ Disable the plugin and restore the bundled adapter first:
 
 ```bash
 hermes plugins disable telegram-guest
-hermes gateway restart
-hermes plugins remove telegram-guest
 ```
 
-The bundled Telegram adapter is restored by the restart before the plugin files are removed.
+Restart the gateway yourself to restore the bundled adapter, then remove the plugin if desired:
+
+```bash
+hermes plugins remove telegram-guest
+```
 
 ## Development
 
