@@ -17,9 +17,10 @@ for path in (PLUGIN_DIR,):
 
 from gateway.platforms.base import SendResult
 from gateway.config import Platform
-from gateway.session import SessionSource
+from gateway.session import SessionSource, build_session_key
 from hermes_cli.plugins import PluginContext, PluginManager, PluginManifest
 from plugins.platforms.telegram import adapter as telegram_base
+from plugins.platforms.telegram import gateway_env
 
 from adapter import (
     GuestEditError,
@@ -60,6 +61,7 @@ async def test_guest_exec_approval_edits_active_bubble_with_two_bound_buttons(ad
     state.inline_message_id = "inline-q"
     state.approval_actor_id = 42
     adapter._guest_active_query["guest:999:42"] = "q"
+    adapter._remember_guest_query("guest:999:42", "q-next")
     adapter._bot._post.return_value = {"message_id": 7}
     prompt = SimpleNamespace(
         chat_id="guest:999:42", session_key="session-key",
@@ -1276,6 +1278,8 @@ def test_register_uses_native_platform_handler_extension():
     assert callable(platform_kwargs["adapter_factory"])
     assert callable(platform_kwargs["check_fn"])
     assert "TELEGRAM_BOT_TOKEN" in platform_kwargs["required_env"]
+    assert platform_kwargs["env_overrides"] is gateway_env.ENV_OVERRIDES
+    assert platform_kwargs["env_enable_credentials"] is gateway_env.ENV_ENABLE_CREDENTIALS
 
 
 def test_native_factory_does_not_mutate_ptb_update_types(adapter):
@@ -2066,7 +2070,7 @@ def test_guest_query_state_is_bounded(adapter):
 
 # --- Persistent session + guest commands -------------------------------------
 
-def _guest_update(update_id, chat_id, caller_id, text, query_id, reply_to=None):
+def _guest_update(update_id, chat_id, caller_id, text, query_id, reply_to=None, thread_id=None):
     raw = {
         "update_id": update_id,
         "api_kwargs": {
@@ -2082,6 +2086,8 @@ def _guest_update(update_id, chat_id, caller_id, text, query_id, reply_to=None):
     }
     if reply_to is not None:
         raw["api_kwargs"]["guest_message"]["reply_to_message"] = reply_to
+    if thread_id is not None:
+        raw["api_kwargs"]["guest_message"]["message_thread_id"] = thread_id
     return SimpleNamespace(**raw)
 
 
@@ -2098,6 +2104,23 @@ def test_persistent_guest_session_uses_real_chat_and_caller(adapter):
     )
 
 
+def test_persistent_guest_session_isolated_by_thread_when_present(adapter):
+    base = {
+        "chat": SimpleNamespace(id="-100999", type="supergroup"),
+        "from_user": SimpleNamespace(id=42),
+    }
+    unthreaded = SimpleNamespace(**base, message_thread_id=None)
+    blank_topic = SimpleNamespace(**base, message_thread_id=" ")
+    first_topic = SimpleNamespace(**base, message_thread_id=17)
+    other_topic = SimpleNamespace(**base, message_thread_id=18)
+
+    assert adapter._guest_session_chat_id(unthreaded, "q0") == "guest:-100999:42"
+    assert adapter._guest_session_chat_id(blank_topic, "qblank") == "guest:-100999:42"
+    assert adapter._guest_session_chat_id(first_topic, "q1") == "guest:-100999:thread:17:42"
+    assert adapter._guest_session_chat_id(first_topic, "q2") == "guest:-100999:thread:17:42"
+    assert adapter._guest_session_chat_id(other_topic, "q3") == "guest:-100999:thread:18:42"
+
+
 def test_legacy_guest_session_when_disabled(adapter):
     adapter.config.extra = {"persistent_guest_sessions": False}
     message = SimpleNamespace(
@@ -2105,6 +2128,199 @@ def test_legacy_guest_session_when_disabled(adapter):
         from_user=SimpleNamespace(id=42),
     )
     assert adapter._guest_session_chat_id(message, "query-1") == "guest:query-1"
+    message.message_thread_id = 17
+    assert adapter._guest_session_chat_id(message, "query-2") == "guest:query-2"
+
+
+@pytest.mark.asyncio
+async def test_guest_update_propagates_thread_to_event_source(adapter):
+    adapter.config.extra = {"allow_from": ["42"]}
+    adapter._build_message_event = lambda message, message_type, update_id=None: SimpleNamespace(
+        source=SessionSource(
+            platform=Platform.TELEGRAM,
+            chat_id=str(message.chat.id),
+            chat_type="group",
+            user_id="42",
+        ),
+        raw_message=message,
+        text=message.text,
+    )
+    adapter.handle_message = AsyncMock()
+
+    await adapter._handle_guest_update(
+        _guest_update(800, -100999, 42, "hello", "query-thread", thread_id=17), None
+    )
+
+    event = adapter.handle_message.await_args.args[0]
+    assert event.source.chat_id == "guest:-100999:thread:17:42"
+    assert event.source.thread_id == "17"
+    assert build_session_key(event.source).endswith(":17")
+
+
+@pytest.mark.asyncio
+async def test_concurrent_guest_query_keeps_send_bound_to_active_query(adapter):
+    adapter.config.extra = {"allow_from": ["42"]}
+    adapter._build_message_event = lambda message, message_type, update_id=None: SimpleNamespace(
+        source=SimpleNamespace(chat_id="999", chat_type="group", user_id="42", thread_id=None),
+        raw_message=message,
+        text=message.text,
+    )
+    first_started = asyncio.Event()
+    release_first = asyncio.Event()
+
+    async def handle_message(event):
+        if event.text == "first":
+            first_started.set()
+            await release_first.wait()
+            result = await adapter.edit_message(
+                event.source.chat_id,
+                "guest-inline-1",
+                "answer for first",
+                finalize=True,
+                metadata={"is_turn_final": True},
+            )
+            assert result.success
+
+    adapter.handle_message = handle_message
+    first = asyncio.create_task(
+        adapter._handle_guest_update(_guest_update(801, -100999, 42, "first", "query-first"), None)
+    )
+    second = None
+    try:
+        await asyncio.wait_for(first_started.wait(), timeout=1)
+        second = asyncio.create_task(
+            adapter._handle_guest_update(_guest_update(802, -100999, 42, "second", "query-second"), None)
+        )
+        await asyncio.sleep(0)
+        assert adapter._guest_session_last_query["guest:-100999:42"] == "query-second"
+    finally:
+        release_first.set()
+        await asyncio.wait_for(first, timeout=2)
+        if second is not None:
+            await asyncio.wait_for(second, timeout=2)
+
+    first_state = adapter._guest_queries["guest:query-first"]
+    second_state = adapter._guest_queries["guest:query-second"]
+    assert first_state.delivered_content == "answer for first"
+    assert second_state.delivered_content != "answer for first"
+
+
+@pytest.mark.asyncio
+async def test_guest_enrichment_failure_releases_active_query_and_lock(adapter):
+    adapter.config.extra = {"allow_from": ["42"]}
+    adapter._build_message_event = lambda message, message_type, update_id=None: SimpleNamespace(
+        source=SimpleNamespace(chat_id="999", chat_type="group", user_id="42", thread_id=None),
+        raw_message=message,
+        text=message.text,
+    )
+
+    async def fail_enrichment(*args):
+        raise RuntimeError("enrichment failed")
+
+    adapter._enrich_guest_direct = fail_enrichment
+    session_chat_id = "guest:-100999:42"
+
+    with pytest.raises(RuntimeError, match="enrichment failed"):
+        await adapter._handle_guest_update(
+            _guest_update(808, -100999, 42, "hello", "query-enrichment-failure"), None
+        )
+
+    assert session_chat_id not in adapter._guest_active_query
+    assert not adapter._guest_session_locks[session_chat_id].locked()
+
+
+@pytest.mark.asyncio
+async def test_guest_messages_in_different_threads_run_independently(adapter):
+    adapter.config.extra = {"allow_from": ["42"]}
+    adapter._build_message_event = lambda message, message_type, update_id=None: SimpleNamespace(
+        source=SimpleNamespace(chat_id="999", chat_type="group", user_id="42", thread_id=None),
+        raw_message=message,
+        text=message.text,
+    )
+    started = {17: asyncio.Event(), 18: asyncio.Event()}
+    release = {17: asyncio.Event(), 18: asyncio.Event()}
+
+    async def handle_message(event):
+        thread_id = int(event.source.thread_id)
+        started[thread_id].set()
+        await release[thread_id].wait()
+
+    adapter.handle_message = handle_message
+    first = asyncio.create_task(
+        adapter._handle_guest_update(
+            _guest_update(803, -100999, 42, "topic one", "query-topic-one", thread_id=17), None
+        )
+    )
+    second = None
+    try:
+        await asyncio.wait_for(started[17].wait(), timeout=1)
+        second = asyncio.create_task(
+            adapter._handle_guest_update(
+                _guest_update(804, -100999, 42, "topic two", "query-topic-two", thread_id=18), None
+            )
+        )
+        await asyncio.wait_for(started[18].wait(), timeout=1)
+    finally:
+        release[17].set()
+        release[18].set()
+        await asyncio.wait_for(first, timeout=2)
+        if second is not None:
+            await asyncio.wait_for(second, timeout=2)
+
+    assert started[17].is_set() and started[18].is_set()
+    assert "guest:-100999:thread:17:42" in adapter._guest_session_locks
+    assert "guest:-100999:thread:18:42" in adapter._guest_session_locks
+
+
+@pytest.mark.asyncio
+async def test_clean_waits_for_active_turn_and_resets_only_its_thread(adapter):
+    adapter.config.extra = {"allow_from": ["42"]}
+
+    def build_event(message, message_type, update_id=None):
+        source = SessionSource(
+            platform=Platform.TELEGRAM,
+            chat_id=str(message.chat.id),
+            chat_type="group",
+            user_id=str(message.from_user.id),
+        )
+        return SimpleNamespace(source=source, raw_message=message, text=message.text)
+
+    started = asyncio.Event()
+    release = asyncio.Event()
+
+    async def handle_message(event):
+        started.set()
+        await release.wait()
+
+    adapter._build_message_event = build_event
+    adapter.handle_message = handle_message
+    adapter._session_store = SimpleNamespace(reset_session=MagicMock())
+
+    active = asyncio.create_task(adapter._handle_guest_update(
+        _guest_update(805, -100999, 42, "hold", "query-active", thread_id=17), None
+    ))
+    clean = None
+    try:
+        await asyncio.wait_for(started.wait(), timeout=1)
+        clean = asyncio.create_task(adapter._handle_guest_update(
+            _guest_update(806, -100999, 42, "@bot /clean", "query-clean-17", thread_id=17), None
+        ))
+        await asyncio.sleep(0)
+        adapter._session_store.reset_session.assert_not_called()
+    finally:
+        release.set()
+        await asyncio.wait_for(active, timeout=2)
+        if clean is not None:
+            await asyncio.wait_for(clean, timeout=2)
+
+    await adapter._handle_guest_update(
+        _guest_update(807, -100999, 42, "@bot /clean", "query-clean-18", thread_id=18), None
+    )
+    keys = [call.args[0] for call in adapter._session_store.reset_session.call_args_list]
+    assert len(keys) == 2
+    assert keys[0] != keys[1]
+    assert adapter._guest_queries["guest:query-clean-17"].delivered_content == "✅ Сессия очищена."
+    assert adapter._guest_queries["guest:query-clean-18"].delivered_content == "✅ Сессия очищена."
 
 
 @pytest.mark.asyncio
