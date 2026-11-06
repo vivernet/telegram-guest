@@ -20,7 +20,11 @@ from gateway.config import Platform
 from gateway.session import SessionSource, build_session_key
 from hermes_cli.plugins import PluginContext, PluginManager, PluginManifest
 from plugins.platforms.telegram import adapter as telegram_base
-from plugins.platforms.telegram import gateway_env
+
+try:
+    from plugins.platforms.telegram import gateway_env
+except ImportError:
+    gateway_env = None
 
 from adapter import (
     GuestEditError,
@@ -1278,8 +1282,68 @@ def test_register_uses_native_platform_handler_extension():
     assert callable(platform_kwargs["adapter_factory"])
     assert callable(platform_kwargs["check_fn"])
     assert "TELEGRAM_BOT_TOKEN" in platform_kwargs["required_env"]
-    assert platform_kwargs["env_overrides"] is gateway_env.ENV_OVERRIDES
-    assert platform_kwargs["env_enable_credentials"] is gateway_env.ENV_ENABLE_CREDENTIALS
+    if gateway_env is None:
+        assert "env_overrides" not in platform_kwargs
+        assert "env_enable_credentials" not in platform_kwargs
+    else:
+        assert platform_kwargs["env_overrides"] is gateway_env.ENV_OVERRIDES
+        assert platform_kwargs["env_enable_credentials"] is gateway_env.ENV_ENABLE_CREDENTIALS
+
+
+def test_register_tolerates_core_without_optional_telegram_gateway_env(monkeypatch):
+    import importlib.util
+
+    real_find_spec = importlib.util.find_spec
+
+    def find_without_gateway_env(name, *args, **kwargs):
+        if name == "plugins.platforms.telegram.gateway_env":
+            return None
+        return real_find_spec(name, *args, **kwargs)
+
+    monkeypatch.setattr(importlib.util, "find_spec", find_without_gateway_env)
+    ctx = MagicMock()
+
+    register(ctx)
+
+    platform_kwargs = ctx.register_platform.call_args.kwargs
+    assert platform_kwargs["name"] == "telegram"
+    assert "env_overrides" not in platform_kwargs
+    assert "env_enable_credentials" not in platform_kwargs
+
+
+def test_register_omits_optional_bridge_when_platform_entry_lacks_fields(monkeypatch):
+    from dataclasses import dataclass
+    import gateway.platform_registry as platform_registry
+
+    @dataclass
+    class LegacyPlatformEntry:
+        name: str
+
+    monkeypatch.setattr(platform_registry, "PlatformEntry", LegacyPlatformEntry)
+    ctx = MagicMock()
+
+    register(ctx)
+
+    platform_kwargs = ctx.register_platform.call_args.kwargs
+    assert platform_kwargs["name"] == "telegram"
+    assert "env_overrides" not in platform_kwargs
+    assert "env_enable_credentials" not in platform_kwargs
+
+
+def test_register_surfaces_platform_registry_import_failure(monkeypatch):
+    import builtins
+
+    real_import = builtins.__import__
+
+    def fail_platform_registry(name, globals=None, locals=None, fromlist=(), level=0):
+        if name == "gateway.platform_registry":
+            raise ImportError("core registry unavailable")
+        return real_import(name, globals, locals, fromlist, level)
+
+    monkeypatch.setattr(builtins, "__import__", fail_platform_registry)
+
+    with pytest.raises(ImportError, match="core registry unavailable"):
+        register(MagicMock())
 
 
 def test_native_factory_does_not_mutate_ptb_update_types(adapter):

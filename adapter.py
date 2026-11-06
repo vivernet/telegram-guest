@@ -1474,9 +1474,31 @@ def _wire_guest_handler(app, adapter) -> None:
     adapter._ensure_guest_handler(app)
 
 
-def register(ctx) -> None:
-    from plugins.platforms.telegram import gateway_env
+def _telegram_gateway_env_kwargs() -> dict:
+    """Use Telegram's optional core env bridge only when this Hermes build exposes it."""
+    from dataclasses import fields
+    from gateway.platform_registry import PlatformEntry
 
+    supported = {field.name for field in fields(PlatformEntry)}
+    bridge_fields = {"env_overrides", "env_enable_credentials"}
+    if not bridge_fields.issubset(supported):
+        return {}
+
+    from importlib import import_module, util
+
+    module_name = "plugins.platforms.telegram.gateway_env"
+    if util.find_spec(module_name) is None:
+        # Hermes 0.23.0 applies Telegram's built-in environment mapping in core.
+        return {}
+
+    gateway_env = import_module(module_name)
+    return {
+        "env_overrides": gateway_env.ENV_OVERRIDES,
+        "env_enable_credentials": gateway_env.ENV_ENABLE_CREDENTIALS,
+    }
+
+
+def register(ctx) -> None:
     ctx.register_platform_handler("telegram", _wire_guest_handler)
     ctx.register_platform(
         name="telegram",
@@ -1495,6 +1517,5 @@ def register(ctx) -> None:
         max_message_length=4096,
         emoji="✈️",
         allow_update_command=True,
-        env_overrides=gateway_env.ENV_OVERRIDES,
-        env_enable_credentials=gateway_env.ENV_ENABLE_CREDENTIALS,
+        **_telegram_gateway_env_kwargs(),
     )

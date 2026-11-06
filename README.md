@@ -4,7 +4,7 @@ Native [Telegram Guest Bot](https://core.telegram.org/bots/features#guest-bots) 
 
 Guest Mode lets someone mention your bot in a Telegram chat where the bot is **not a member**. Telegram sends the bot limited context and allows one response. This plugin adds that update and response path while delegating ordinary Telegram traffic to Hermes' bundled adapter.
 
-> **Compatibility:** requires Hermes `v0.23.0` or newer for the native Telegram environment-to-config bridge, and is verified with `python-telegram-bot 22.8`. The plugin still uses selected private Telegram delivery/enrichment helpers, so a future Hermes update may require a compatibility fix.
+> **Compatibility:** requires Hermes `v0.23.0` or newer and is verified with `python-telegram-bot 22.8`. The plugin feature-detects the optional Telegram `gateway_env` bridge; Hermes `v0.23.0` applies its built-in Telegram environment mapping in core, so absence of that optional module does not block plugin registration. The plugin still uses selected private Telegram delivery/enrichment helpers, so a future Hermes update may require a compatibility fix.
 
 ## Install with Hermes
 
